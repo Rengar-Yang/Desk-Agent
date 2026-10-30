@@ -4,6 +4,8 @@ import json
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor, QCursor
+
+from orbit.ui.fonts import mono_font_css, ui_font, ui_font_css
 from PyQt5.QtWidgets import (
     QApplication, QDialog, QFrame, QGraphicsDropShadowEffect, QHBoxLayout, QLabel,
     QPlainTextEdit, QPushButton, QVBoxLayout,
@@ -69,6 +71,7 @@ class ApprovalDialog(QDialog):
 
     def __init__(self, title, detail, parent=None):
         super().__init__(parent, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setFont(ui_font(13, subpixel=False))
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setModal(True)
         self.setWindowTitle(title)
@@ -125,18 +128,18 @@ class ApprovalDialog(QDialog):
 
         self.setStyleSheet(f"""
             #approvalCard {{ background: #fdfdff; border: 1px solid {accent}; border-radius: 18px; }}
-            QLabel {{ color: #353448; background: transparent; font: 12px 'Noto Sans CJK SC'; }}
+            QLabel {{ color: #353448; background: transparent; font-family: {ui_font_css()}; font-size: 13px; }}
             #approvalBadge {{
                 color: {accent}; background: {soft.name(QColor.HexArgb)};
-                border-radius: 8px; padding: 3px 8px; font-weight: 700; font-size: 11px;
+                border-radius: 8px; padding: 3px 8px; font-weight: 600; font-size: 12px;
             }}
-            #approvalTitle {{ font-size: 15px; font-weight: 700; }}
-            #approvalHint, #approvalKeys, #fieldLabel {{ color: #8b879b; font-size: 11px; }}
+            #approvalTitle {{ font-size: 15px; font-weight: 600; }}
+            #approvalHint, #approvalKeys, #fieldLabel {{ color: #8b879b; font-size: 12px; }}
             QPlainTextEdit {{
                 background: #f4f2f8; border: 0; border-radius: 10px;
-                padding: 8px; color: #2d2c38; font: 12px 'Noto Sans Mono CJK SC', monospace;
+                padding: 8px; color: #2d2c38; font-family: {mono_font_css()}; font-size: 13px;
             }}
-            QPushButton {{ border: 0; border-radius: 10px; padding: 8px 12px; font-size: 13px; }}
+            QPushButton {{ border: 0; border-radius: 10px; padding: 8px 12px; font-family: {ui_font_css()}; font-size: 13px; }}
             #denyButton {{ background: #eeeaf6; color: #5c5678; }}
             #denyButton:hover {{ background: #e4def2; }}
             #allowButton {{ background: {accent}; color: white; font-weight: 700; }}

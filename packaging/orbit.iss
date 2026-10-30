@@ -1,4 +1,4 @@
-; Inno Setup script. packaging/build-windows.ps1 compiles this into dist\Orbit-Setup.exe.
+﻿; Inno Setup script. packaging/build-windows.ps1 compiles this into dist\Orbit-Setup.exe.
 
 #define MyAppName "Orbit"
 #define MyAppVersion "0.2.0"
@@ -19,14 +19,14 @@ OutputBaseFilename=Orbit-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayName={#MyAppName}
 VersionInfoVersion={#MyAppVersion}.0
 CloseApplications=yes
 
 [Languages]
-Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+Name: "chinesesimplified"; MessagesFile: "languages\ChineseSimplified.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
@@ -34,7 +34,7 @@ Name: "desktopicon"; Description: "创建桌面快捷方式"
 Name: "autostart"; Description: "登录 Windows 后自动启动"
 
 [Files]
-Source: "..\dist\Orbit\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "config.toml"
+Source: "..\dist\Orbit\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs; Excludes: "config.toml,api.txt"
 Source: "..\dist\Orbit\config.toml"; DestDir: "{app}"; Flags: onlyifdoesntexist uninsneveruninstall
 
 [Icons]

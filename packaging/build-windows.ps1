@@ -1,4 +1,4 @@
-# Build dist\Orbit-Setup.exe on 64-bit Windows.
+﻿# Build dist\Orbit-Setup.exe on 64-bit Windows.
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $false
 $packaging = $PSScriptRoot
@@ -17,11 +17,15 @@ python -m PyInstaller (Join-Path $packaging "orbit.spec") --noconfirm --clean
 if (-not (Test-Path (Join-Path $root "dist\Orbit\Orbit.exe"))) {
     throw "没有生成 dist\Orbit\Orbit.exe。"
 }
+# PyInstaller 6 puts data files in _internal. The installer keeps a copy beside
+# the exe so an upgrade does not overwrite a config the user already edited.
+Copy-Item (Join-Path $root "config.toml") (Join-Path $root "dist\Orbit\config.toml") -Force
 
 function Find-Iscc {
     $candidates = @(
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
     )
     foreach ($candidate in $candidates) {
         if (Test-Path $candidate) { return $candidate }

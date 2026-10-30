@@ -3,6 +3,8 @@
 import html
 import re
 
+from orbit.ui.fonts import mono_font_css
+
 
 def markdown_to_html(source):
     """Turn common Markdown into Qt rich text so reply markers are rendered."""
@@ -19,14 +21,14 @@ def markdown_to_html(source):
         escaped = html.escape(body.strip("\n")).replace("\n", "<br>")
         return (
             "<div style=\"background:#f3f1f8;border-radius:8px;padding:8px 10px;"
-            "margin:4px 0;font-family:monospace;\">" + escaped + "</div>"
+            "margin:4px 0;font-family:" + mono_font_css() + ";\">" + escaped + "</div>"
         )
 
     text = re.sub(r"```[^\n`]*\n(.*?)```", lambda match: hold(code_block(match.group(1))), text, flags=re.S)
     text = re.sub(
         r"`([^`\n]+)`",
         lambda match: hold(
-            "<span style=\"background:#eceaf3;border-radius:4px;padding:0 4px;font-family:monospace;\">"
+            "<span style=\"background:#eceaf3;border-radius:4px;padding:0 4px;font-family:" + mono_font_css() + ";\">"
             + html.escape(match.group(1)) + "</span>"
         ),
         text,

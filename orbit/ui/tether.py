@@ -1,4 +1,4 @@
-"""The elastic band drawn between the home perch and the mascot."""
+"""The elastic band drawn between the drag origin and the mascot."""
 
 import math
 import time
@@ -27,6 +27,8 @@ class TetherWindow(QWidget):
         self.release_duration = .28
         self.unit = get_config().mascot.scale
         self.break_distance = get_config().tether.break_distance
+        self.bend = 0.0
+        self._last_end = None
         self.flow = QTimer(self)
         self.flow.timeout.connect(self.tick)
         self.flow.start(16)
@@ -38,7 +40,10 @@ class TetherWindow(QWidget):
             if self._snap_pending:
                 self._snap_pending = False
                 self.snapped.emit()
-        elif self.isVisible(): self.update()
+        elif self.isVisible():
+            if abs(self.bend) > 0.04:
+                self.bend *= 0.96
+            self.update()
 
     def release(self, duration=.28):
         if self.isVisible() and self.release_started is None:
@@ -47,39 +52,122 @@ class TetherWindow(QWidget):
             self.broken = True
             self._snap_pending = True
 
+    def reset_motion(self):
+        """Forget the previous drag so the next pull starts as a round blob."""
+        self.bend = 0.0
+        self._last_end = None
+
     @staticmethod
-    def ribbon(a, b, ra, rb, waist):
-        dx, dy = b.x()-a.x(), b.y()-a.y()
-        length = max(1, math.hypot(dx,dy))
-        ux, uy = dx/length, dy/length
+    def ribbon(a, b, ra, rb, waist, bend=0.0):
+        """A variable-width band whose ends are semicircles, never flat cuts.
+
+        A straight cap (lineTo across the end) meets the sides at a corner.
+        Sampling the outline and turning each end through a half-circle keeps
+        the whole pull, including the first few pixels, rounded.
+        """
+        sx, sy = float(a.x()), float(a.y())
+        ex, ey = float(b.x()), float(b.y())
+        dx, dy = ex - sx, ey - sy
+        length = math.hypot(dx, dy)
+        ra = max(2.0, float(ra))
+        rb = max(2.0, float(rb))
+        waist = max(2.0, float(waist))
+        if length < 1.5:
+            radius = max(ra, rb, waist)
+            path = QPainterPath()
+            path.addEllipse(sx - radius, sy - radius, radius * 2, radius * 2)
+            return path
+        ux, uy = dx / length, dy / length
         nx, ny = -uy, ux
-        pull = min(length*.22,40)
-        points = lambda x,y,r: (x+nx*r,y+ny*r)
-        mid = ((a.x()+b.x())/2,(a.y()+b.y())/2)
-        p = QPainterPath()
-        s,e,m = points(a.x(),a.y(),ra),points(b.x(),b.y(),rb),points(*mid,waist)
-        p.moveTo(*s)
-        p.cubicTo(s[0]+ux*pull,s[1]+uy*pull,m[0]-ux*pull,m[1]-uy*pull,*m)
-        p.cubicTo(m[0]+ux*pull,m[1]+uy*pull,e[0]-ux*pull,e[1]-uy*pull,*e)
-        s,e,m = points(a.x(),a.y(),-ra),points(b.x(),b.y(),-rb),points(*mid,-waist)
-        p.lineTo(*e)
-        p.cubicTo(e[0]-ux*pull,e[1]-uy*pull,m[0]+ux*pull,m[1]+uy*pull,*m)
-        p.cubicTo(m[0]-ux*pull,m[1]-uy*pull,s[0]+ux*pull,s[1]+uy*pull,*s)
-        p.closeSubpath()
-        return p
+        bend = float(bend) * min(1.0, length / 90.0)
+        mid_x = (sx + ex) / 2 + nx * bend
+        mid_y = (sy + ey) / 2 + ny * bend
+        # While the pull is still short, keep the middle as wide as the ends
+        # so the shape is a capsule instead of a pinched rectangle.
+        pinch = min(1.0, max(0.0, (length - 36.0) / 120.0))
+        waist = waist * pinch + max(ra, rb) * (1.0 - pinch)
+
+        def point_at(t):
+            omt = 1.0 - t
+            x = omt * omt * sx + 2 * omt * t * mid_x + t * t * ex
+            y = omt * omt * sy + 2 * omt * t * mid_y + t * t * ey
+            edge = ra * omt + rb * t
+            belly = math.sin(math.pi * t)
+            return x, y, max(2.0, edge * (1.0 - belly) + waist * belly)
+
+        samples = 24
+        centers = [point_at(i / samples) for i in range(samples + 1)]
+
+        def tangent_at(index):
+            if index == 0:
+                tx = centers[1][0] - centers[0][0]
+                ty = centers[1][1] - centers[0][1]
+            elif index == samples:
+                tx = centers[index][0] - centers[index - 1][0]
+                ty = centers[index][1] - centers[index - 1][1]
+            else:
+                tx = centers[index + 1][0] - centers[index - 1][0]
+                ty = centers[index + 1][1] - centers[index - 1][1]
+            mag = math.hypot(tx, ty) or 1.0
+            return tx / mag, ty / mag
+
+        def arc_points(cx, cy, radius, nx0, ny0, outward_x, outward_y):
+            start = math.atan2(ny0, nx0)
+            midpoint = start + math.pi / 2
+            target = math.atan2(outward_y, outward_x)
+            delta = math.atan2(math.sin(midpoint - target), math.cos(midpoint - target))
+            sweep = math.pi if abs(delta) <= math.pi / 2 else -math.pi
+            points = []
+            steps = 14
+            for step in range(1, steps):
+                angle = start + sweep * step / steps
+                points.append((cx + math.cos(angle) * radius, cy + math.sin(angle) * radius))
+            return points
+
+        right = []
+        left = []
+        for index, (x, y, radius) in enumerate(centers):
+            tx, ty = tangent_at(index)
+            right.append((x - ty * radius, y + tx * radius))
+            left.append((x + ty * radius, y - tx * radius))
+        end_tx, end_ty = tangent_at(samples)
+        end_x, end_y, end_r = centers[-1]
+        start_tx, start_ty = tangent_at(0)
+        start_x, start_y, start_r = centers[0]
+        path = QPainterPath()
+        path.moveTo(*right[0])
+        for point in right[1:]:
+            path.lineTo(*point)
+        for point in arc_points(end_x, end_y, end_r, -end_ty, end_tx, end_tx, end_ty):
+            path.lineTo(*point)
+        for point in reversed(left):
+            path.lineTo(*point)
+        for point in arc_points(start_x, start_y, start_r, start_ty, -start_tx, -start_tx, -start_ty):
+            path.lineTo(*point)
+        path.closeSubpath()
+        return path
 
     def update_points(self, start, end):
         distance = math.hypot(start.x() - end.x(), start.y() - end.y())
         if self.broken:
             return
+        if self._last_end is not None and distance > 1:
+            dx = end.x() - start.x()
+            dy = end.y() - start.y()
+            side = (-dy * (end.x() - self._last_end.x()) + dx * (end.y() - self._last_end.y())) / distance
+            pulled = max(-22.0, min(22.0, side * 1.2))
+            self.bend = self.bend * 0.55 + pulled * 0.45
+        self._last_end = QPointF(end)
         self.start = start
         self.end = end
-        left = min(start.x(), end.x()) - 24
-        top = min(start.y(), end.y()) - 24
-        self.setGeometry(left, top, abs(start.x() - end.x()) + 48, abs(start.y() - end.y()) + 48)
+        margin = int(math.ceil(40 * self.unit + abs(self.bend)))
+        left = min(start.x(), end.x()) - margin
+        top = min(start.y(), end.y()) - margin
+        self.setGeometry(int(left), int(top), int(abs(start.x() - end.x()) + margin * 2), int(abs(start.y() - end.y()) + margin * 2))
         self.show()
         self.update()
-        if distance > self.break_distance: self.release()
+        if distance > self.break_distance:
+            self.release()
 
     def paintEvent(self, _event):
         if not self.start or not self.end:
@@ -89,36 +177,30 @@ class TetherWindow(QWidget):
         a = self.start - self.pos()
         b = self.end - self.pos()
         dx, dy = b.x() - a.x(), b.y() - a.y()
-        length = max(1, (dx * dx + dy * dy) ** 0.5)
-        nx, ny = -dy / length, dx / length
+        length = max(1.0, math.hypot(dx, dy))
         u = self.unit
-        waist = max(2.5 * u, 14 * u - length / 21)
-        width_a, width_b = 14 * u, 15 * u
-        mid_x, mid_y = (a.x() + b.x()) / 2, (a.y() + b.y()) / 2
-        path = QPainterPath()
-        path.moveTo(a.x() + nx * width_a, a.y() + ny * width_a)
-        path.quadTo(mid_x + nx * waist, mid_y + ny * waist, b.x() + nx * width_b, b.y() + ny * width_b)
-        path.lineTo(b.x() - nx * width_b, b.y() - ny * width_b)
-        path.quadTo(mid_x - nx * waist, mid_y - ny * waist, a.x() - nx * width_a, a.y() - ny * width_a)
-        path.closeSubpath()
+        span = max(1.0, self.break_distance - 12)
+        tension = max(0.0, min(1.0, (length - 12) / span))
+        ripple = math.sin(time.monotonic() * 14) * 1.15 * u * math.sin(math.pi * tension)
+        waist = max(2.2 * u, 14 * u - 11.5 * u * tension ** 0.58 + ripple)
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#2d2d31"))
-        span = max(1, self.break_distance - 12)
-        tension = max(0, min(1, (length - 12) / span))
-        u = self.unit
-        waist = max(2.2 * u, 14 * u - 11.5 * u * tension ** .58 + math.sin(time.monotonic() * 14) * 1.15 * u * math.sin(math.pi * tension))
         if self.release_started:
-            progress = min(1,(time.monotonic()-self.release_started)/self.release_duration)
-            eased = 1-(1-progress)**3
-            reach = .5-.47*eased
-            painter.setOpacity(min(1,(1-progress)*1.5))
-            tip_a = QPointF(a.x()+dx*reach,a.y()+dy*reach)
-            tip_b = QPointF(b.x()-dx*reach,b.y()-dy*reach)
-            painter.drawPath(self.ribbon(a,tip_a,13*u*(1-eased*.5),max(.3,8*u*(1-eased)),max(.3,waist*(1-eased))))
-            painter.drawPath(self.ribbon(b,tip_b,16*u*(1-eased*.5),max(.3,8*u*(1-eased)),max(.3,waist*(1-eased))))
+            progress = min(1, (time.monotonic() - self.release_started) / self.release_duration)
+            eased = 1 - (1 - progress) ** 3
+            reach = 0.5 - 0.47 * eased
+            painter.setOpacity(min(1, (1 - progress) * 1.5))
+            tip_a = QPointF(a.x() + dx * reach, a.y() + dy * reach)
+            tip_b = QPointF(b.x() - dx * reach, b.y() - dy * reach)
+            painter.drawPath(self.ribbon(a, tip_a, 13 * u * (1 - eased * 0.5), max(0.8, 8 * u * (1 - eased)), max(0.8, waist * (1 - eased)), 0))
+            painter.drawPath(self.ribbon(b, tip_b, 16 * u * (1 - eased * 0.5), max(0.8, 8 * u * (1 - eased)), max(0.8, waist * (1 - eased)), 0))
+            nx, ny = -dy / length, dx / length
+            mid_x, mid_y = (a.x() + b.x()) / 2, (a.y() + b.y()) / 2
             for i in range(3):
-                spread=(i-1)*(9+22*eased)*u
-                painter.drawEllipse(QPointF(mid_x+nx*spread,mid_y+ny*spread),float((4-i)*u),float((4-i)*u))
+                spread = (i - 1) * (9 + 22 * eased) * u
+                painter.drawEllipse(QPointF(mid_x + nx * spread, mid_y + ny * spread), float((4 - i) * u), float((4 - i) * u))
         else:
-            painter.drawPath(self.ribbon(a,b,(16-tension*5)*u,(18-tension*4)*u,waist))
+            painter.drawPath(self.ribbon(
+                a, b, (16 - tension * 5) * u, (18 - tension * 4) * u, waist, self.bend,
+            ))
         painter.end()

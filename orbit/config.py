@@ -203,7 +203,9 @@ def load_api_token():
     token_path = Path(get_config().api.token_file).expanduser()
     if not token_path.is_absolute():
         token_path = APP_CONFIG_FILE.parent / token_path
-    candidates = [token_path, CONFIG_DIR / token_path.name]
+    # The key saved from Settings lives in the user config dir and wins over
+    # a token file shipped beside the program.
+    candidates = [CONFIG_DIR / token_path.name, token_path]
     seen = set()
     for path in candidates:
         if path in seen:
@@ -256,3 +258,16 @@ def load_user_settings():
 def save_user_settings(settings):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     CONFIG_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_api_token(token):
+    """Store the API key outside the install folder so upgrades do not touch it."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    path = CONFIG_DIR / "api.txt"
+    text = (token or "").strip()
+    if text.lower().startswith("bearer "):
+        text = text[7:].strip()
+    if not text:
+        path.unlink(missing_ok=True)
+        return
+    path.write_text(text + "\n", encoding="utf-8")

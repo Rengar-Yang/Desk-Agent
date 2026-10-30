@@ -11,14 +11,15 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from PyQt5.QtCore import (
-    QAbstractAnimation, QObject, QPoint, QRect, Qt, QThread, QTimer, QEasingCurve, QPropertyAnimation, pyqtSignal,
+    QAbstractAnimation, QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, QEasingCurve, QPropertyAnimation, pyqtSignal,
 )
-from PyQt5.QtGui import QColor, QCursor, QFont, QPainter, QPen, QRegion
+from PyQt5.QtGui import QColor, QCursor, QPainter, QPen, QPolygon, QRegion
 from PyQt5.QtWidgets import QApplication, QDialog, QMenu, QMessageBox, QWidget
 
 from orbit.agent.codex import CodexBridge
 from orbit.agent.tools import API_TOOLS, api_error_text, kill_running_shell, run_tool, tool_label
-from orbit.config import get_config, load_api_token, load_user_settings, save_user_settings
+from orbit.config import get_config, load_api_token, load_user_settings, save_api_token, save_user_settings
+from orbit.presets import preset_by_id
 from orbit.desktop.context import capture_context, context_prompt
 from orbit.desktop.common import hydrate_window, topmost_at
 from orbit.theme import ACCENTS, KIND_LABELS
@@ -28,6 +29,7 @@ from orbit.ui.notch import HomeNotch
 from orbit.ui.overlay import TargetOverlay
 from orbit.ui.probe import WindowProbe
 from orbit.desktop.autostart import set_login_autostart
+from orbit.ui.fonts import ui_font
 from orbit.ui.settings import SettingsDialog
 from orbit.ui.tether import TetherWindow
 
@@ -48,7 +50,10 @@ class Pet(QWidget):
         # Keep a generous transparent canvas around the smaller painted mascot.
         mascot = get_config().mascot
         self.unit = mascot.scale
-        self.setFixedSize(mascot.canvas_width, mascot.canvas_height)
+        # Room above and beside the rest pose so squash, ears, and the badge
+        # stay inside the widget instead of being cut off by its edge.
+        self.pad = round(72 * self.unit)
+        self.setFixedSize(mascot.canvas_width + self.pad * 2, mascot.canvas_height + self.pad * 2)
         self.pet_scale = mascot.paint_scale
         self.pet_padding = 24 * self.unit
         self.docked = True
@@ -143,7 +148,7 @@ class Pet(QWidget):
         self.motion.timeout.connect(self.animate_pet)
         self.motion.start(16)
         screen = QApplication.primaryScreen().availableGeometry()
-        self.home = QPoint(screen.center().x() - self.width() // 2, screen.top())
+        self.home = QPoint(screen.center().x() - self.width() // 2, screen.top() - self.pad)
         self.move(self.home)
         self.notch.reveal(screen)
         self.show()
@@ -151,7 +156,10 @@ class Pet(QWidget):
         QTimer.singleShot(200, self.request_windows)
 
     def backend_label(self):
-        return "自定义 API" if self.settings.get("provider") == "api" else "本机 Codex"
+        if self.settings.get("provider") != "api":
+            return "本机 Codex"
+        preset = preset_by_id(self.settings.get("preset"))
+        return preset.label if preset else "自定义 API"
 
     def load_settings(self):
         return load_user_settings()
@@ -200,11 +208,12 @@ class Pet(QWidget):
     def placement(self):
         """Return the mascot's unscaled origin and scale inside the widget."""
         u = self.unit
+        pad = self.pad
         scale_free = self.pet_scale * (self.drag_growth if self.drag_from_home and self.dragged else 1)
         cy = (24 + 68 * (self.drag_growth - .5)) * u if self.drag_from_home and self.dragged else 58 * u
-        free = (56 * u - 41 * scale_free, cy - 43 * scale_free, scale_free)
+        free = (pad + 56 * u - 41 * scale_free, pad + cy - 43 * scale_free, scale_free)
         scale_dock = self.pet_scale * .5
-        dock = (self.width() / 2 - 41 * scale_dock, 24 * u - 36 * scale_dock, scale_dock)
+        dock = (self.width() / 2 - 41 * scale_dock, pad + 24 * u - 36 * scale_dock, scale_dock)
         if self.dock_started:
             progress = min(1, (time.monotonic() - self.dock_started) / .32)
             ease = 1 - (1 - progress) ** 3
@@ -221,21 +230,103 @@ class Pet(QWidget):
     def contact_y(self):
         """Widget y of the window edge. The head stays above it; the arms hang below it."""
         scale = self.pet_scale
-        return 58 * self.unit - 43 * scale + 72 * scale
+        return self.pad + 58 * self.unit - 43 * scale + 72 * scale
+
+    def _motion_pose(self):
+        """Squash and lift shared by painting and the clip mask. Does not clear landing."""
+        elapsed = time.monotonic() - self.mood_started
+        y, angle, sx, sy = 0., 0., 1., 1.
+        wave = lambda duration: (1 - math.cos(elapsed * 2 * math.pi / duration)) / 2
+        holding = self.target and not self.docked and (self.grip > 0.08 or abs(self.slip) > 0.45 or abs(self.lean) > 0.45)
+        if self.mood == "idle" and not self.docked:
+            if holding:
+                y = self.slip * 0.85
+                angle = self.lean
+                sx, sy = 1 + .07 * self.grip, 1 - .1 * self.grip
+            elif self.target:
+                y, sx, sy = 2 * wave(3.8), 1 + .025 * wave(3.8), 1 - .02 * wave(3.8)
+            else:
+                y, sx, sy = -6 * wave(3.6), 1 + .035 * wave(3.6), 1 - .02 * wave(3.6)
+        elif self.mood == "dragging":
+            sx, sy = 1.06 + .04 * wave(.68), .94 + .04 * (1 - wave(.68))
+        elif self.mood == "thinking":
+            y, sx, sy = -3 * wave(1.1), 1 + .03 * wave(1.1), 1 - .04 * wave(1.1)
+        elif self.mood == "working":
+            y, sx, sy = 2 * wave(.48), 1 + .04 * wave(.48), 1 - .05 * wave(.48)
+        idle_progress = max(0., min(1., 1 - (self.idle_until - time.monotonic()) / .9))
+        idle_wave = math.sin(idle_progress * math.pi) if time.monotonic() < self.idle_until else 0.
+        if self.mood == "idle" and self.idle_kind == "hop":
+            y -= 6 * idle_wave
+            sx += .04 * idle_wave
+            sy -= .06 * idle_wave
+        frames = None
+        progress = 1.
+        if self.landing_started is not None:
+            progress = (time.monotonic() - self.landing_started) / .78
+            frames = [(0, -28, 0, .65, 1.45), (.27, 8, 0, 1.34, .66), (.48, -12, 0, .82, 1.25), (.66, 4, 0, 1.13, .85), (.82, -3, 0, .94, 1.07), (1, 0, 0, 1, 1)]
+        elif self.mood == "done":
+            progress = elapsed / .68
+            frames = [(0, 0, 0, 1, 1), (.35, -9, 0, .94, 1.1), (.7, 2, 0, 1.08, .9), (1, 0, 0, 1, 1)]
+        landing_done = False
+        if frames and progress < 1:
+            for a, b in zip(frames, frames[1:]):
+                if a[0] <= progress <= b[0]:
+                    t = (progress - a[0]) / (b[0] - a[0])
+                    y, angle, sx, sy = [a[i] + (b[i] - a[i]) * t for i in range(1, 5)]
+                    break
+        elif self.landing_started is not None:
+            landing_done = True
+        if holding and self.mood != "idle" and not (frames and progress < 1):
+            y += self.slip * 0.6
+            angle += self.lean * 0.65
+            sx += .05 * self.grip
+            sy -= .07 * self.grip
+        return y, angle, sx, sy, idle_wave, landing_done, progress
+
+    def _map_local(self, lx, ly, origin_x, origin_y, scale, lift, angle, sx, sy):
+        dx = (lx - 41) * sx
+        dy = (ly - 43) * sy
+        rad = math.radians(angle)
+        cos, sin = math.cos(rad), math.sin(rad)
+        return (
+            origin_x + scale * (41 + dx * cos - dy * sin),
+            origin_y + scale * (43 + lift + dx * sin + dy * cos),
+        )
+
+    @staticmethod
+    def _disk(cx, cy, rx, ry):
+        rx = max(1.0, rx)
+        ry = max(1.0, ry)
+        polygon = QPolygon([
+            QPoint(int(cx + math.cos(step) * rx), int(cy + math.sin(step) * ry))
+            for step in (index * math.tau / 20 for index in range(20))
+        ])
+        return QRegion(polygon)
 
     def refresh_mask(self):
+        """Cover every painted part, including squash and ears, so animation is not clipped."""
         origin_x, origin_y, scale = self.placement()
-        body = QRect(int(origin_x - 8), int(origin_y - 6), int(90 * scale + 16), int(96 * scale + 18))
-        region = QRegion(body, QRegion.Ellipse)
-        perched = bool(self.target) and not self.docked and not self.drag_start
-        if perched:
-            for paw_x in (16, 48):
-                paw = QRect(int(origin_x + paw_x * scale) - 2, int(origin_y + 60 * scale), int(22 * scale) + 4, int(28 * scale))
-                region = region.united(QRegion(paw, QRegion.Ellipse))
+        lift, angle, sx, sy, _idle, _done, _progress = self._motion_pose()
+        stretch = max(abs(sx), abs(sy), 1.0)
+
+        def cover(lx, ly, radius):
+            cx, cy = self._map_local(lx, ly, origin_x, origin_y, scale, lift, angle, sx, sy)
+            pad = 6
+            return self._disk(cx, cy, radius * scale * stretch + pad, radius * scale * stretch + pad)
+
+        region = cover(41, 41, 36)
+        region = region.united(cover(21, 15, 20))
+        region = region.united(cover(61, 15, 20))
+        show_paws = bool(self.target) and not self.docked
+        if show_paws:
+            region = region.united(cover(25, 74, 16))
+            region = region.united(cover(57, 74, 16))
         if self.mood in ("thinking", "working", "done"):
-            badge = QRect(int(origin_x + 56 * scale), int(origin_y - 6 * scale), int(28 * scale), int(28 * scale))
-            region = region.united(QRegion(badge, QRegion.Ellipse))
-        key = (body.getRect(), self.mood in ("thinking", "working", "done"), perched)
+            region = region.united(cover(70, 10, 18))
+        if self.landing_started is not None:
+            region = region.united(cover(41, 41, 64))
+        bounds = region.boundingRect()
+        key = (bounds.getRect(), show_paws, self.mood, round(lift), round(angle), round(sx * 8), round(sy * 8))
         if key == self._mask_key:
             return
         self._mask_key = key
@@ -376,51 +467,9 @@ class Pet(QWidget):
         painter.scale(scale, scale)
         elapsed = time.monotonic() - self.mood_started
         painter.save()
-        y, angle, sx, sy = 0., 0., 1., 1.
-        wave = lambda duration: (1 - math.cos(elapsed * 2 * math.pi / duration)) / 2
-        holding = self.target and not self.docked and (self.grip > 0.08 or abs(self.slip) > 0.45 or abs(self.lean) > 0.45)
-        if self.mood == "idle" and not self.docked:
-            if holding:
-                y = self.slip * 0.85
-                angle = self.lean
-                sx, sy = 1 + .07 * self.grip, 1 - .1 * self.grip
-            elif self.target:
-                y, sx, sy = 2 * wave(3.8), 1 + .025 * wave(3.8), 1 - .02 * wave(3.8)
-            else:
-                y, sx, sy = -6 * wave(3.6), 1 + .035 * wave(3.6), 1 - .02 * wave(3.6)
-        elif self.mood == "dragging":
-            sx, sy = 1.06 + .04 * wave(.68), .94 + .04 * (1 - wave(.68))
-        elif self.mood == "thinking":
-            y, sx, sy = -3 * wave(1.1), 1 + .03 * wave(1.1), 1 - .04 * wave(1.1)
-        elif self.mood == "working":
-            y, sx, sy = 2 * wave(.48), 1 + .04 * wave(.48), 1 - .05 * wave(.48)
-        idle_progress = max(0., min(1., 1-(self.idle_until-time.monotonic())/.9))
-        idle_wave = math.sin(idle_progress*math.pi) if time.monotonic()<self.idle_until else 0.
-        if self.mood == "idle" and self.idle_kind == "hop":
-            y -= 6 * idle_wave
-            sx += .04 * idle_wave
-            sy -= .06 * idle_wave
-        frames = None
-        progress = 1.
-        if self.landing_started is not None:
-            progress = (time.monotonic() - self.landing_started) / .78
-            frames = [(0,-28,0,.65,1.45),(.27,8,0,1.34,.66),(.48,-12,0,.82,1.25),(.66,4,0,1.13,.85),(.82,-3,0,.94,1.07),(1,0,0,1,1)]
-        elif self.mood == "done":
-            progress = elapsed / .68
-            frames = [(0,0,0,1,1),(.35,-9,0,.94,1.1),(.7,2,0,1.08,.9),(1,0,0,1,1)]
-        if frames and progress < 1:
-            for a, b in zip(frames, frames[1:]):
-                if a[0] <= progress <= b[0]:
-                    t = (progress-a[0])/(b[0]-a[0])
-                    y, angle, sx, sy = [a[i]+(b[i]-a[i])*t for i in range(1,5)]
-                    break
-        elif self.landing_started is not None:
+        y, angle, sx, sy, idle_wave, landing_done, progress = self._motion_pose()
+        if landing_done:
             self.landing_started = None
-        if holding and self.mood != "idle" and not (frames and progress < 1):
-            y += self.slip * 0.6
-            angle += self.lean * 0.65
-            sx += .05 * self.grip
-            sy -= .07 * self.grip
         painter.translate(41, 43+y)
         painter.rotate(angle)
         painter.scale(sx, sy)
@@ -479,9 +528,15 @@ class Pet(QWidget):
         if self.mood in ("thinking", "working", "done"):
             painter.setBrush(QColor("#ffffff"))
             painter.drawEllipse(58, -2, 24, 24)
+            symbol = {"thinking": "…", "working": "✦", "done": "✓"}[self.mood]
+            center = painter.transform().map(QPointF(70, 10))
+            painter.save()
+            painter.resetTransform()
+            painter.setFont(ui_font(max(12, round(13 * scale)), bold=True, subpixel=False))
             painter.setPen(QColor("#6c62a0" if self.mood != "done" else "#4aa882"))
-            painter.setFont(QFont("Sans", 11, QFont.Bold))
-            painter.drawText(QRect(58, -2, 24, 24), Qt.AlignCenter, {"thinking": "…", "working": "✦", "done": "✓"}[self.mood])
+            painter.setRenderHint(QPainter.TextAntialiasing, True)
+            painter.drawText(QRectF(center.x() - 18, center.y() - 16, 36, 32), Qt.AlignCenter, symbol)
+            painter.restore()
         painter.restore()
         painter.end()
 
@@ -499,6 +554,7 @@ class Pet(QWidget):
             self.tether.broken = False
             self.tether.release_started = None
             self.tether._snap_pending = False
+            self.tether.reset_motion()
             if self.drag_from_home:
                 self._close_notch_after_snap = False
                 self._notch_released = False
@@ -610,6 +666,7 @@ class Pet(QWidget):
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
+        menu.setFont(ui_font(13))
         menu.addAction("打开对话", self.open_chat)
         menu.addAction("设置", self.open_settings)
         menu.addAction("回到顶部", self.detach)
@@ -981,12 +1038,14 @@ class Pet(QWidget):
         if not Path(cwd).is_dir():
             QMessageBox.warning(self, "Orbit", "请选择存在的工作目录。")
             return
+        chosen = dialog.choice()
         self.settings = {"cwd": cwd, "attach": dialog.auto_attach.isChecked(),
                          "auto_open": dialog.auto_open.isChecked(), "hints": dialog.hints.isChecked(),
-                         "provider": "api" if dialog.provider.currentIndex() else "codex",
-                         "endpoint": dialog.endpoint.text().strip(), "model": dialog.model.text().strip()}
+                         "provider": chosen["provider"], "preset": chosen["preset"],
+                         "endpoint": chosen["endpoint"], "model": chosen["model"]}
         self.api_token = dialog.token.text().strip()
         save_user_settings(self.settings)
+        save_api_token(self.api_token)
         self.chat.set_backend_label(self.backend_label())
         self.set_autostart(dialog.autostart.isChecked())
 

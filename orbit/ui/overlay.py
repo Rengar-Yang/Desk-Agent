@@ -8,6 +8,7 @@ from PyQt5.QtGui import QColor, QPainter, QPen
 from PyQt5.QtWidgets import QWidget
 
 from orbit.theme import ACCENTS
+from orbit.ui.fonts import ui_font
 
 
 class TargetOverlay(QWidget):
@@ -57,6 +58,8 @@ class TargetOverlay(QWidget):
         phase = (1 - math.cos(time.monotonic() * 2 * math.pi / 1.2)) / 2
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.TextAntialiasing)
+        p.setFont(ui_font(13))
         accent = QColor(self.accent)
         if not self.connected:
             glow = QColor(accent)

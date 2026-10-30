@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import (
 
 from orbit.config import get_config
 from orbit.theme import ACCENTS, CONTEXT_PROMPTS, KIND_LABELS
+from orbit.ui.fonts import ui_font, ui_font_css
 from orbit.ui.markdown import markdown_to_html
 
 
@@ -20,6 +21,7 @@ class ChatWindow(QWidget):
 
     def __init__(self):
         super().__init__(None, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setFont(ui_font(13))
         self.setWindowModality(Qt.NonModal)
         self.setAttribute(Qt.WA_InputMethodEnabled, True)
         self.setFocusPolicy(Qt.StrongFocus)
@@ -139,14 +141,14 @@ class ChatWindow(QWidget):
         banner = soft.name(QColor.HexArgb)
         self.setStyleSheet(f"""
             #chatCard {{ background: #fdfdff; border: 1px solid {accent}; border-radius: 19px; }}
-            QLabel {{ color: #353448; background: transparent; font: 12px 'Noto Sans CJK SC'; }}
-            #chatTitle {{ font-size: 14px; font-weight: 700; }}
-            #chatPath, #footnote, #status {{ color: #8b879b; font-size: 10px; }}
+            QLabel {{ color: #353448; background: transparent; font-family: {ui_font_css()}; font-size: 13px; }}
+            #chatTitle {{ font-size: 15px; font-weight: 600; }}
+            #chatPath, #footnote, #status {{ color: #8b879b; font-size: 12px; }}
             #contextBanner {{ background: {banner}; border-radius: 12px; }}
-            #contextTitle {{ color: {accent}; font-weight: 700; }}
-            #contextText {{ color: #8b82a7; font-size: 10px; }}
-            QLineEdit {{ border: 1px solid #e1ddec; border-radius: 11px; padding: 8px 12px; background: #fff; color: #343448; }}
-            QPushButton {{ border: 0; border-radius: 10px; padding: 7px 10px; background: #eeeaf8; color: #655696; font-size: 11px; }}
+            #contextTitle {{ color: {accent}; font-weight: 600; }}
+            #contextText {{ color: #8b82a7; font-size: 12px; }}
+            QLineEdit {{ border: 1px solid #e1ddec; border-radius: 11px; padding: 8px 12px; background: #fff; color: #343448; font-family: {ui_font_css()}; font-size: 13px; }}
+            QPushButton {{ border: 0; border-radius: 10px; padding: 7px 10px; background: #eeeaf8; color: #655696; font-family: {ui_font_css()}; font-size: 13px; }}
             QPushButton:hover {{ background: #e4def5; }}
             #sendButton {{ background: {accent}; color: #fff; font-size: 17px; font-weight: 700; }}
             #closeButton {{ background: transparent; color: #89849b; font-size: 20px; }}
@@ -214,6 +216,7 @@ class ChatWindow(QWidget):
 
     def append(self, author, text):
         bubble = QLabel()
+        bubble.setFont(ui_font(13))
         bubble.raw_text = text
         bubble.author = author
         bubble.setWordWrap(True)
