@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#d7dcf2" />
+    <title>Orbit · 桌面 AI 助手原型</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="desktop" id="desktop">
+      <div class="wallpaper-orb wallpaper-orb-a"></div>
+      <div class="wallpaper-orb wallpaper-orb-b"></div>
+      <div class="wallpaper-grain"></div>
+      <div class="notch-bar" aria-hidden="true"></div>
+      <svg class="notch-shape" viewBox="0 0 800 145" preserveAspectRatio="none" aria-hidden="true"><path d="M0 0H800V21H603C559 21 576 108 510 108H290C224 108 241 21 197 21H0Z"/></svg>
+      <div class="notch-face" id="notchFace" aria-hidden="true"><i></i><i></i></div>
+      <svg class="tether-layer" id="tetherLayer" aria-hidden="true">
+        <defs>
+          <linearGradient id="tetherGradient" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#343439"/><stop offset=".52" stop-color="#2d2d31"/><stop offset="1" stop-color="#1b1b20"/></linearGradient>
+        </defs>
+        <path class="tether-body" id="tetherPath"/>
+        <path class="tether-fragment" id="tetherStartFragment"/>
+        <path class="tether-fragment" id="tetherEndFragment"/>
+        <g class="tether-droplets" id="tetherDroplets"><circle r="4"/><circle r="3"/><circle r="2"/></g>
+      </svg>
+
+      <header class="menu-bar">
+        <div class="menu-left"><span class="menu-logo">✦</span><button type="button" class="menu-app-button" id="openAvatarMenu" aria-haspopup="menu" aria-expanded="false" aria-controls="avatarMenu">Orbit ▾</button><span>文件</span><span>编辑</span><span>窗口</span></div>
+        <div class="menu-right"><span class="demo-indicator"><span></span> INTERACTIVE DEMO</span><span id="clock">10:24</span><span class="battery">▰▰▰</span></div>
+      </header>
+
+      <div class="desktop-icon icon-one"><span class="desktop-icon-art">◈</span><span>工作空间</span></div>
+      <div class="desktop-icon icon-two"><span class="desktop-icon-art">▤</span><span>备忘录</span></div>
+
+      <main class="stage" aria-label="交互演示桌面">
+        <section class="app-window browser-window" data-window="browser" tabindex="0" aria-label="浏览器窗口">
+          <div class="window-titlebar">
+            <div class="traffic"><i></i><i></i><i></i></div>
+            <div class="browser-address"><span>⌕</span> docs.orbit.design / getting-started</div>
+            <div class="window-utility">↗</div>
+          </div>
+          <div class="browser-body">
+            <div class="browser-topline">ORBIT <span>DOCS</span></div>
+            <div class="browser-hero"><div class="tiny-label">DOCUMENTATION / 01</div><h2>Make space<br/>for ideas<span>.</span></h2><p>把灵感留在当下，让工作自然发生。</p><div class="browser-cta">开始探索 <span>↗</span></div></div>
+            <div class="browser-cards"><div><span>✧</span> 快速开始</div><div><span>◫</span> 组件指南</div></div>
+          </div>
+        </section>
+
+        <section class="app-window editor-window" data-window="editor" tabindex="0" aria-label="代码编辑器窗口">
+          <div class="window-titlebar">
+            <div class="traffic"><i></i><i></i><i></i></div>
+            <span class="titlebar-name">orbit-app — Visual Studio Code</span>
+            <span class="window-utility">⌘</span>
+          </div>
+          <div class="editor-body">
+            <div class="editor-rail"><span>▤</span><span>⌕</span><span>⑂</span><span>◈</span></div>
+            <div class="editor-sidebar"><div class="sidebar-heading">EXPLORER <span>···</span></div><div class="sidebar-sub">⌄ ORBIT-APP</div><div>⌄ <span class="folder-color">▸</span> src</div><div class="indent">◇ App.tsx</div><div class="indent">◇ island.ts</div><div class="indent">◇ styles.css</div><div><span class="folder-color">▸</span> public</div><div>▤ package.json</div></div>
+            <div class="editor-code"><div class="code-tab">◇ &nbsp; island.ts <span>×</span></div><div class="code-lines"><div><em>1</em><span class="purple">export</span> <span class="purple">function</span> <span class="yellow">attachToWindow</span>(target) {</div><div><em>2</em>&nbsp; <span class="purple">const</span> context = <span class="blue">readContext</span>(target);</div><div><em>3</em>&nbsp; <span class="purple">return</span> agent.<span class="blue">connect</span>({</div><div><em>4</em>&nbsp; &nbsp; window: target,</div><div><em>5</em>&nbsp; &nbsp; context,</div><div><em>6</em>&nbsp; &nbsp; mode: <span class="green">'assist'</span></div><div><em>7</em>&nbsp; });</div><div><em>8</em>}</div><div><em>9</em></div><div><em>10</em><span class="muted-code">// Your ideas, in motion.</span></div></div></div>
+          </div>
+          <div class="editor-status">⎇ main <span>TypeScript · UTF-8</span></div>
+        </section>
+
+        <section class="app-window finder-window active-window" data-window="finder" tabindex="0" aria-label="文件管理器窗口">
+          <div class="window-titlebar finder-titlebar">
+            <div class="traffic"><i></i><i></i><i></i></div>
+            <div class="finder-nav"><span>‹</span><span>›</span></div>
+            <div class="finder-heading"><span class="folder-glyph">▰</span><span>设计资料</span><span class="heading-caret">⌄</span></div>
+            <div class="finder-toolbar"><span>▦</span><span>☷</span><span>⌕</span><span>···</span></div>
+          </div>
+          <div class="finder-content">
+            <aside class="finder-sidebar">
+              <div class="side-label">收藏</div>
+              <div class="side-item"><span>⌂</span> 最近使用</div>
+              <div class="side-item"><span>▤</span> 桌面</div>
+              <div class="side-item"><span>↓</span> 下载</div>
+              <div class="side-label second-label">位置</div>
+              <div class="side-item"><span>▣</span> Macintosh HD</div>
+              <div class="side-item selected"><span>▰</span> 设计资料</div>
+              <div class="side-item"><span>☁</span> iCloud Drive</div>
+              <div class="side-label second-label">标签</div>
+              <div class="tag-item"><i class="tag-purple"></i> 项目</div>
+              <div class="tag-item"><i class="tag-orange"></i> 待处理</div>
+            </aside>
+            <div class="finder-main">
+              <div class="finder-path">个人空间 <span>›</span> 项目 <span>›</span> <strong>设计资料</strong></div>
+              <div class="file-grid" id="fileGrid">
+                <div class="file-item" data-file="品牌手册.pdf"><div class="file-art pdf-art"><span>PDF</span><b>Brand<br/>Guidelines</b><small>2026 / V2.0</small></div><span>品牌手册.pdf</span><small>2.4 MB</small></div>
+                <div class="file-item" data-file="首页视觉.fig"><div class="file-art fig-art"><div class="fig-mark">◉</div><div class="fig-shape"></div></div><span>首页视觉.fig</span><small>8.6 MB</small></div>
+                <div class="file-item" data-file="产品截图.png"><div class="file-art image-art"><div class="image-sun"></div><div class="image-hill"></div></div><span>产品截图.png</span><small>1.8 MB</small></div>
+                <div class="file-item" data-file="动效参考.mp4"><div class="file-art video-art"><div class="play-circle">▶</div></div><span>动效参考.mp4</span><small>24.3 MB</small></div>
+                <div class="file-item" data-file="文案草稿.md"><div class="file-art doc-art"><b>✦</b><span>把灵感<br/>变成现实。</span></div><span>文案草稿.md</span><small>12 KB</small></div>
+                <div class="file-item" data-file="Logo 源文件.ai"><div class="file-art ai-art"><b>Ai</b></div><span>Logo 源文件.ai</span><small>3.2 MB</small></div>
+              </div>
+              <div class="finder-footer"><span id="fileCount">6 个项目</span><span>剩余空间 128 GB</span></div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <div class="drop-hint" id="dropHint" role="status"><span class="hint-sparkle" id="dropHintIcon">✦</span><span class="drop-hint-copy"><strong id="dropHintTitle">松开以接管窗口</strong><small id="dropHintDetail"></small></span></div>
+
+      <div class="assistant pet-mode" id="assistant" data-mood="idle" role="group" aria-label="可拖动的 AI 助手">
+        <div class="island" id="island" tabindex="0" aria-label="点击聊天、拖动到窗口，或右键打开设置">
+          <div class="island-glow"></div><div class="ai-orb"><div class="orb-core"></div><div class="orb-sheen"></div><div class="pet-face"><i></i><i></i><b></b></div></div><span class="pet-paws" aria-hidden="true"><i></i><i></i></span><span class="mood-effect" aria-hidden="true"></span>
+          <div class="island-copy"><strong id="islandTitle">Orbit AI</strong><span id="islandSubtitle">拖到一个窗口，开始协作</span></div>
+          <div class="island-bars"><i></i><i></i><i></i><i></i></div>
+        </div>
+        <div class="pet-caption" id="petCaption">点击聊天 · 拖到窗口 ✦</div>
+        <div class="chat-panel" id="chatPanel" aria-hidden="true">
+          <div class="chat-header"><div class="chat-app-icon" id="chatAppIcon">✦</div><div class="chat-heading"><strong id="chatTitle">Orbit AI</strong><span id="chatPath">待命中 · 可以直接聊天</span></div><button class="icon-button" id="detachButton" title="收起对话" aria-label="收起对话">×</button></div>
+          <div class="context-banner"><div class="context-icon">✧</div><div><strong id="contextTitle">随时可以聊聊</strong><p id="contextDescription">把我拖到窗口，或直接问我问题</p></div><span class="context-check">✓</span></div>
+          <div class="chat-messages" id="chatMessages"><div class="chat-bubble ai-message">你好！点击我可以随时聊天，也可以把我拖到窗口上一起工作。</div></div>
+          <div class="suggestions" id="suggestions"></div>
+          <form class="composer" id="chatForm"><input id="chatInput" autocomplete="off" placeholder="让 Orbit 帮你做点什么..." aria-label="给 AI 发送消息"/><button type="submit" aria-label="发送消息">↑</button></form>
+          <div class="chat-footnote" id="chatFootnote">✦ 交互演示 · 操作仅作用于当前原型</div>
+        </div>
+      </div>
+
+      <div class="avatar-menu" id="avatarMenu" role="menu" aria-label="Orbit 菜单" hidden><button type="button" role="menuitem" data-action="settings">⚙ &nbsp;设置</button><button type="button" role="menuitem" data-action="reset">↩ &nbsp;回到顶部</button><button type="button" role="menuitem" data-action="clear">⌫ &nbsp;清空对话</button></div>
+      <div class="settings-backdrop" id="settingsBackdrop" hidden></div>
+      <section class="settings-panel" id="settingsPanel" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
+        <div class="settings-head"><div><small>ORBIT / PREFERENCES</small><h2 id="settingsTitle">助手设置</h2></div><button type="button" id="closeSettings" aria-label="关闭设置">×</button></div>
+        <form id="settingsForm">
+          <label>回复来源<select id="replyMode"><option value="demo">演示回复</option><option value="api">自定义后端接口</option></select></label>
+          <div class="api-fields" id="apiFields"><label>接口地址<input id="apiEndpoint" type="url" placeholder="http://localhost:8000/api/chat" autocomplete="url" /></label><label>模型名称<input id="apiModel" type="text" placeholder="可选，由后端决定" autocomplete="off" /></label><label>访问令牌<input id="apiToken" type="password" placeholder="可选，仅保留在当前页面" autocomplete="off" /></label><p class="settings-help">浏览器直接向接口发送 POST 请求。令牌不会保存；后端需允许此页面跨域访问，并返回 <code>{"reply":"..."}</code>。</p></div>
+          <label class="setting-check"><input id="autoOpenPanel" type="checkbox" checked /><span><strong>吸附后自动展开对话</strong><small>关闭后可点击吉祥物展开</small></span></label>
+          <label class="setting-check"><input id="showDragHints" type="checkbox" checked /><span><strong>显示拖拽提示</strong><small>拖到窗口时显示目标名称</small></span></label>
+          <div class="settings-actions"><button type="button" id="testApi">测试接口</button><button type="submit">保存设置</button></div>
+          <p class="settings-status" id="settingsStatus" role="status"></p>
+        </form>
+      </section>
+
+      <div class="guide-card" id="guideCard"><div class="guide-badge">✦</div><div class="guide-text"><span>点击聊天 · 右键设置</span><strong>拖到任意窗口，让 Orbit 吸附并协作</strong></div><button id="guideClose" aria-label="关闭提示">×</button></div>
+
+      <div class="dock" aria-label="模拟程序坞"><div class="dock-icon finder-dock">◐</div><div class="dock-icon browser-dock">◎</div><div class="dock-icon editor-dock">⌘</div><div class="dock-divider"></div><div class="dock-icon notes-dock">▤</div><div class="dock-icon trash-dock">▥</div></div>
+      <div class="toast" id="toast" role="status"></div>
+    </div>
+    <script src="./script.js"></script>
+  </body>
+</html>
