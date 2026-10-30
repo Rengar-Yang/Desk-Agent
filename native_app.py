@@ -20,7 +20,7 @@ from PyQt5.QtCore import QAbstractAnimation, QObject, QPoint, QProcess, QProcess
 from PyQt5.QtGui import QColor, QFont, QPainter, QPainterPath, QPen, QCursor, QRegion
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout,
-    QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizePolicy,
+    QLabel, QLineEdit, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSizeGrip, QSizePolicy,
     QVBoxLayout, QWidget,
 )
 
@@ -203,6 +203,24 @@ def visible_window_rect(values, props):
             if candidate[2] > 40 and candidate[3] > 40:
                 return candidate
     return (x, y, width, height)
+
+
+def query_window_rect(wid):
+    """Visible rect of one window, or None when it is gone or hidden."""
+    geo = run_x("xwininfo", "-id", wid)
+    if "Map State: IsViewable" not in geo:
+        return None
+    values = {}
+    for key in ("Absolute upper-left X", "Absolute upper-left Y", "Width", "Height"):
+        match = re.search(rf"{re.escape(key)}:\s*(-?\d+)", geo)
+        if match:
+            values[key] = int(match.group(1))
+    if len(values) != 4 or values["Width"] < 80 or values["Height"] < 60:
+        return None
+    props = run_x("xprop", "-id", wid, "_GTK_FRAME_EXTENTS", "_NET_FRAME_EXTENTS", "_NET_WM_STATE")
+    if "_NET_WM_STATE_HIDDEN" in props:
+        return None
+    return visible_window_rect(values, props)
 
 
 def unescape_xprop(text):
@@ -1089,6 +1107,7 @@ class WindowProbe(QObject):
     """Poll X11 off the UI thread so the mascot animation keeps its frame time."""
 
     found = pyqtSignal(int, object)
+    placed = pyqtSignal(str, object)
 
     def __init__(self):
         super().__init__()
@@ -1096,6 +1115,8 @@ class WindowProbe(QObject):
         self._busy = False
         self._again = None
         self.seq = 0
+        self._watch = None
+        self._watch_running = False
 
     def request(self, own_ids):
         with self._lock:
@@ -1106,6 +1127,50 @@ class WindowProbe(QObject):
                 return
             self._busy = True
         threading.Thread(target=self._work, args=job, daemon=True).start()
+
+    def watch(self, wid):
+        with self._lock:
+            self._watch = str(wid)
+            if self._watch_running:
+                return
+            self._watch_running = True
+        threading.Thread(target=self._watch_loop, daemon=True).start()
+
+    def unwatch(self):
+        with self._lock:
+            self._watch = None
+
+    def _watch_loop(self):
+        last = None
+        seen = None
+        miss_sent = False
+        while True:
+            with self._lock:
+                wid = self._watch
+                if wid is None:
+                    if self._watch is None:
+                        self._watch_running = False
+                        return
+                    wid = self._watch
+            if wid != seen:
+                seen = wid
+                last = None
+                miss_sent = False
+            try:
+                rect = query_window_rect(wid)
+            except Exception:
+                rect = None
+            if rect is None:
+                if not miss_sent:
+                    miss_sent = True
+                    last = None
+                    self.placed.emit(wid, None)
+            else:
+                miss_sent = False
+                if rect != last:
+                    last = rect
+                    self.placed.emit(wid, rect)
+            time.sleep(0.04)
 
     def _work(self, seq, own_ids):
         try:
@@ -1477,7 +1542,14 @@ class ChatWindow(QWidget):
         self.setAttribute(Qt.WA_InputMethodEnabled, True)
         self.setFocusPolicy(Qt.StrongFocus)
         self.setObjectName("chatCard")
-        self.setFixedSize(374, 494)
+        self.setMinimumSize(320, 420)
+        self.setMaximumSize(820, 900)
+        self.resize(374, 494)
+        self.setMouseTracking(True)
+        self._resizing = None
+        self._resize_until = 0.
+        self._press_global = None
+        self._press_geom = None
         self.accent = ACCENTS["other"]
         root = QVBoxLayout(self)
         root.setContentsMargins(17, 16, 17, 12)
@@ -1520,7 +1592,9 @@ class ChatWindow(QWidget):
         self.area = QScrollArea()
         self.area.setObjectName("messageArea")
         self.area.setWidgetResizable(True)
+        self.area.setFrameShape(QScrollArea.NoFrame)
         self.area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.area.verticalScrollBar().setSingleStep(28)
         self.messages = QWidget()
         self.message_layout = QVBoxLayout(self.messages)
         self.message_layout.setContentsMargins(2, 3, 2, 3)
@@ -1554,6 +1628,9 @@ class ChatWindow(QWidget):
         self.footnote.setObjectName("footnote")
         footer.addWidget(self.footnote)
         footer.addStretch()
+        self.size_grip = QSizeGrip(self)
+        self.size_grip.setObjectName("sizeGrip")
+        footer.addWidget(self.size_grip)
         self.stop_button = QPushButton("停止")
         self.stop_button.clicked.connect(self.stop.emit)
         self.stop_button.hide()
@@ -1583,7 +1660,13 @@ class ChatWindow(QWidget):
             QPushButton:hover {{ background: #e4def5; }}
             #sendButton {{ background: {accent}; color: #fff; font-size: 17px; font-weight: 700; }}
             #closeButton {{ background: transparent; color: #89849b; font-size: 20px; }}
+            #sizeGrip {{ background: transparent; width: 14px; height: 14px; }}
             #messageArea, #messageArea QWidget {{ border: 0; background: #fdfdff; }}
+            #messageArea QScrollBar:vertical {{ background: transparent; width: 8px; margin: 4px 2px 4px 0; }}
+            #messageArea QScrollBar::handle:vertical {{ background: rgba(138, 128, 168, 110); min-height: 36px; border-radius: 4px; }}
+            #messageArea QScrollBar::handle:vertical:hover {{ background: {accent}; }}
+            #messageArea QScrollBar::add-line:vertical, #messageArea QScrollBar::sub-line:vertical {{ height: 0; width: 0; background: transparent; border: 0; }}
+            #messageArea QScrollBar::add-page:vertical, #messageArea QScrollBar::sub-page:vertical {{ background: transparent; }}
         """)
         self.icon.setStyleSheet(f"background: {banner}; color: {accent}; border-radius: 10px; font-size: 18px;")
 
@@ -1644,7 +1727,7 @@ class ChatWindow(QWidget):
         bubble.setTextFormat(Qt.PlainText)
         bubble.setWordWrap(True)
         bubble.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        bubble.setMaximumWidth(282)
+        bubble.setMaximumWidth(self.bubble_width())
         bubble.setContentsMargins(11, 9, 11, 9)
         if author == "你":
             bubble.setStyleSheet("background: #313040; color: white; border-radius: 12px; padding: 7px;")
@@ -1677,6 +1760,100 @@ class ChatWindow(QWidget):
         self.current_bubble = None
         self.send_button.setEnabled(True)
         self.stop_button.hide()
+
+    def bubble_width(self):
+        return max(160, self.width() - 92)
+
+    def is_user_resizing(self):
+        return self._resizing is not None or time.monotonic() < self._resize_until
+
+    def relayout_bubbles(self):
+        if not hasattr(self, "message_layout"):
+            return
+        width = self.bubble_width()
+        for index in range(self.message_layout.count()):
+            row = self.message_layout.itemAt(index).widget()
+            layout = row.layout() if row else None
+            if layout is None:
+                continue
+            for child_index in range(layout.count()):
+                widget = layout.itemAt(child_index).widget()
+                if isinstance(widget, QLabel) and widget.wordWrap():
+                    widget.setMaximumWidth(width)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._resize_until = time.monotonic() + 0.2
+        self.relayout_bubbles()
+
+    def _hit_edge(self, pos):
+        margin = 7
+        left = pos.x() <= margin
+        right = pos.x() >= self.width() - margin
+        top = pos.y() <= margin
+        bottom = pos.y() >= self.height() - margin
+        if not (left or right or top or bottom):
+            return None
+        return (left, right, top, bottom)
+
+    def _cursor_for(self, edge):
+        if edge is None:
+            return Qt.ArrowCursor
+        left, right, top, bottom = edge
+        if (left and top) or (right and bottom):
+            return Qt.SizeFDiagCursor
+        if (right and top) or (left and bottom):
+            return Qt.SizeBDiagCursor
+        if left or right:
+            return Qt.SizeHorCursor
+        return Qt.SizeVerCursor
+
+    def mousePressEvent(self, event):
+        edge = self._hit_edge(event.pos()) if event.button() == Qt.LeftButton else None
+        if edge:
+            self._resizing = edge
+            self._press_global = event.globalPos()
+            self._press_geom = self.geometry()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._resizing and event.buttons() & Qt.LeftButton:
+            self._apply_resize(event.globalPos())
+            event.accept()
+            return
+        self.setCursor(self._cursor_for(self._hit_edge(event.pos())))
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._resizing:
+            self._resizing = None
+            self._resize_until = time.monotonic() + 0.2
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def _apply_resize(self, global_pos):
+        delta = global_pos - self._press_global
+        geom = self._press_geom
+        left, right, top, bottom = self._resizing
+        x, y, width, height = geom.x(), geom.y(), geom.width(), geom.height()
+        if left:
+            width -= delta.x()
+        if right:
+            width += delta.x()
+        if top:
+            height -= delta.y()
+        if bottom:
+            height += delta.y()
+        width = max(self.minimumWidth(), min(self.maximumWidth(), width))
+        height = max(self.minimumHeight(), min(self.maximumHeight(), height))
+        if left:
+            x = geom.right() - width + 1
+        if top:
+            y = geom.bottom() - height + 1
+        self.setGeometry(x, y, width, height)
 
 
 class TetherWindow(QWidget):
@@ -2018,6 +2195,16 @@ class Pet(QWidget):
         self.landing_started = None
         self.phase = 0
         self.bounce = 0
+        self.live_rect = None
+        self.grip = 0.
+        self.slip = 0.
+        self.slip_v = 0.
+        self.lean = 0.
+        self.lean_v = 0.
+        self.ride_vx = 0.
+        self.ride_vy = 0.
+        self.ride_at = 0.
+        self._frame_at = time.monotonic()
         self.animation = QPropertyAnimation(self, b"pos", self)
         self.animation.setEasingCurve(QEasingCurve.OutBack)
         self.animation.setDuration(500)
@@ -2030,6 +2217,7 @@ class Pet(QWidget):
         self.chat_fade.setEasingCurve(QEasingCurve.OutCubic)
         self.probe = WindowProbe()
         self.probe.found.connect(self.on_windows)
+        self.probe.placed.connect(self.on_window_moved)
         self.context_bridge = ContextBridge()
         self.context_bridge.ready.connect(self.apply_context)
         self.timer = QTimer(self)
@@ -2074,6 +2262,25 @@ class Pet(QWidget):
         self.phase += 0.16
         if self.bounce > 0:
             self.bounce = max(0, self.bounce - 1)
+        frame = min(0.05, max(0.001, now - self._frame_at))
+        self._frame_at = now
+        if now - self.ride_at > 0.09:
+            self.ride_vx *= 0.84
+            self.ride_vy *= 0.84
+        speed = math.hypot(self.ride_vx, self.ride_vy)
+        grip_target = min(1., max(0., (speed - 36) / 620))
+        self.grip += (grip_target - self.grip) * min(1., frame * 10)
+        if grip_target > 0.1:
+            lean_target = max(-7., min(7., -self.ride_vx / 140))
+            slip_target = max(-10., min(6., -self.ride_vy / 170))
+            self.lean += (lean_target - self.lean) * min(1., frame * 14)
+            self.slip += (slip_target - self.slip) * min(1., frame * 14)
+            self.lean_v = self.slip_v = 0.
+        else:
+            self.slip_v += (-36 * self.slip - 9 * self.slip_v) * frame
+            self.slip += self.slip_v * frame
+            self.lean_v += (-38 * self.lean - 9 * self.lean_v) * frame
+            self.lean += self.lean_v * frame
         self.refresh_mask()
         self.update()
 
@@ -2217,7 +2424,27 @@ class Pet(QWidget):
         x = right if right + self.chat.width() <= area.right() - 8 else left
         x = max(area.left() + 8, min(x, area.right() - self.chat.width() - 8))
         y = max(area.top() + 8, min(y_anchor, area.bottom() - self.chat.height() - 8))
-        self.chat.move(x, y)
+        if not self.chat.is_user_resizing():
+            self.chat.move(x, y)
+
+    def place_on_window(self, rect, allow_bounce=False):
+        """Move the mascot and the chat together so they stay locked to the window."""
+        destination = QPoint(rect.center().x() - self.width() // 2, rect.top() - round(self.contact_y()))
+        if self.pos() != destination:
+            if allow_bounce and self.bounce:
+                self.animate_to(destination, 420)
+            else:
+                self.animation.stop()
+                self.move(destination)
+        if not self.chat.isVisible():
+            return
+        opening = self.chat_motion.state() == QAbstractAnimation.Running
+        if opening and allow_bounce:
+            return
+        if opening:
+            self.chat_motion.stop()
+            self.chat.setWindowOpacity(1)
+        self.move_chat()
 
     def paintEvent(self, _event):
         painter = QPainter(self)
@@ -2229,8 +2456,13 @@ class Pet(QWidget):
         painter.save()
         y, angle, sx, sy = 0., 0., 1., 1.
         wave = lambda duration: (1 - math.cos(elapsed * 2 * math.pi / duration)) / 2
+        holding = self.target and not self.docked and (self.grip > 0.08 or abs(self.slip) > 0.45 or abs(self.lean) > 0.45)
         if self.mood == "idle" and not self.docked:
-            if self.target:
+            if holding:
+                y = self.slip * 0.85
+                angle = self.lean
+                sx, sy = 1 + .07 * self.grip, 1 - .1 * self.grip
+            elif self.target:
                 y, sx, sy = 2 * wave(3.8), 1 + .025 * wave(3.8), 1 - .02 * wave(3.8)
             else:
                 y, sx, sy = -6 * wave(3.6), 1 + .035 * wave(3.6), 1 - .02 * wave(3.6)
@@ -2262,6 +2494,11 @@ class Pet(QWidget):
                     break
         elif self.landing_started is not None:
             self.landing_started = None
+        if holding and self.mood != "idle" and not (frames and progress < 1):
+            y += self.slip * 0.6
+            angle += self.lean * 0.65
+            sx += .05 * self.grip
+            sy -= .07 * self.grip
         painter.translate(41, 43+y)
         painter.rotate(angle)
         painter.scale(sx, sy)
@@ -2280,13 +2517,15 @@ class Pet(QWidget):
             tap = (1 - math.cos(elapsed * 2 * math.pi / .48)) / 2 if self.mood == "working" else 0
             lift_left = 5 * tap if self.mood == "working" else 0
             lift_right = 5 * (1 - tap) if self.mood == "working" else 0
-            painter.drawEllipse(16, int(66 - lift_left), 18, 16)
-            painter.drawEllipse(48, int(66 - lift_right), 18, 16)
+            dig = 5 * self.grip + max(0., -self.slip) * 0.45
+            spread = 2.6 * self.grip
+            painter.drawEllipse(int(16 - spread), int(66 + dig - lift_left), 18, 16)
+            painter.drawEllipse(int(48 + spread), int(66 + dig - lift_right), 18, 16)
         painter.drawEllipse(11, 11, 60, 60)
         if self.target and not self.docked:
             painter.setPen(QPen(QColor(255, 255, 255, 120), 1))
-            painter.drawArc(20, int(74 - lift_left), 10, 5, 200 * 16, 140 * 16)
-            painter.drawArc(52, int(74 - lift_right), 10, 5, 200 * 16, 140 * 16)
+            painter.drawArc(int(20 - spread), int(74 + dig - lift_left), 10, 5, 200 * 16, 140 * 16)
+            painter.drawArc(int(52 + spread), int(74 + dig - lift_right), 10, 5, 200 * 16, 140 * 16)
             painter.setPen(Qt.NoPen)
         ear_cycle = time.monotonic() % 6
         ear = 0.
@@ -2384,6 +2623,7 @@ class Pet(QWidget):
             if self.target and self.target["id"] == self.held_id:
                 self.bounce = 10
                 self.landing_started = time.monotonic()
+                self.probe.watch(self.target["id"])
                 self.follow_target()
                 if self.settings.get("auto_open", True):
                     QTimer.singleShot(260, self.open_chat)
@@ -2399,10 +2639,13 @@ class Pet(QWidget):
                 self.begin_context(self.target)
                 self.bounce = 10
                 self.landing_started = time.monotonic()
+                self.probe.watch(self.target["id"])
                 self.follow_target()
                 if self.settings.get("auto_open", True):
                     QTimer.singleShot(260, self.open_chat)
             else:
+                self.probe.unwatch()
+                self.live_rect = None
                 self.context_token += 1
                 self.context_pending = False
                 self.pending_message = None
@@ -2478,6 +2721,10 @@ class Pet(QWidget):
         self.api_history.clear()
         self.bridge.invalidate()
         self.target = None
+        self.live_rect = None
+        self.probe.unwatch()
+        self.grip = self.slip = self.lean = 0.
+        self.ride_vx = self.ride_vy = 0.
         self.overlay.set_target(None)
         self.chat.set_context(None)
         self.chat.send_button.setEnabled(True)
@@ -2504,19 +2751,40 @@ class Pet(QWidget):
         self.target = current
         if not title_changed:
             self.target.update({key: value for key, value in preserved.items() if value is not None})
-        rect = current["rect"]
+        rect = self.live_rect if self.live_rect is not None else current["rect"]
+        self.target["rect"] = rect
         self.overlay.set_target(self.target, False, connected=True)
-        destination = QPoint(rect.center().x() - self.width() // 2, rect.top() - round(self.contact_y()))
-        if self.pos() != destination:
-            if self.bounce:
-                self.animate_to(destination, 420)
-            else:
-                self.move(destination)
+        self.place_on_window(rect, allow_bounce=True)
         if title_changed:
             self.begin_context(self.target)
-        if self.chat.isVisible() and self.chat_motion.state() != QAbstractAnimation.Running:
-            self.move_chat()
         self.update()
+
+    def on_window_moved(self, wid, rect):
+        if self.drag_start or not self.target or self.target.get("id") != wid:
+            return
+        if rect is None:
+            self.misses += 1
+            if self.misses >= 4:
+                self.detach()
+            return
+        self.misses = 0
+        new_rect = QRect(*rect)
+        old = self.target.get("rect")
+        moved = old is None or old.topLeft() != new_rect.topLeft() or old.size() != new_rect.size()
+        if moved and old is not None:
+            now = time.monotonic()
+            dt = max(0.02, now - self.ride_at) if self.ride_at else 0.04
+            self.ride_at = now
+            self.ride_vx = (new_rect.center().x() - old.center().x()) / dt
+            self.ride_vy = (new_rect.top() - old.top()) / dt
+        self.live_rect = new_rect
+        self.target["rect"] = new_rect
+        for window in self.cached_windows:
+            if window["id"] == wid:
+                window["rect"] = QRect(new_rect)
+                break
+        self.overlay.set_target(self.target, False, connected=True)
+        self.place_on_window(new_rect, allow_bounce=not moved)
 
     def working_directory(self):
         fallback = Path(self.settings.get("cwd") or Path.home()).expanduser()
