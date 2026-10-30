@@ -11,7 +11,29 @@
 ~/.local/share/orbit-codex/orbit-codex
 ```
 
-安装脚本会复制程序到 `~/.local/share/orbit-codex`，创建应用菜单项，并在 `~/.config/autostart` 创建登录自启动项。右键桌宠进入“设置”，可关闭自启动或选择 Codex 工作目录。卸载运行 `./uninstall.sh`。
+安装脚本会把 `orbit` 包和启动入口复制到 `~/.local/share/orbit-codex`，创建应用菜单项，并在 `~/.config/autostart` 创建登录自启动项。右键桌宠进入“设置”，可关闭自启动、选择回复来源或 Codex 工作目录。卸载运行 `./uninstall.sh`。
+
+直接在项目目录运行：
+
+```bash
+python3 native_app.py
+```
+
+## 配置
+
+项目根目录的 `config.toml` 控制吉祥物大小、对话窗口初始尺寸、默认接口、颜色和快捷提问。例如把吉祥物放大到 1.4 倍：
+
+```toml
+[mascot]
+scale = 1.4
+
+[api]
+provider = "api"
+endpoint = "https://你的服务/v1/chat/completions"
+model = "你的模型"
+```
+
+访问令牌仍放在 `api.txt`，不要写进配置。设置窗口保存过的目录和接口位于 `~/.config/orbit-codex/settings.json`，会覆盖配置文件里的同名默认值。修改 `config.toml` 后重新启动 Orbit。重新运行 `install.sh` 会更新程序，但不会覆盖已经安装过的那份 `config.toml`。
 
 Codex 通过本机 `codex app-server` 运行，使用当前 Codex CLI 登录状态。每个工作目录会建立独立会话。Codex 在工作目录内使用 `workspace-write` 沙箱，额外权限请求会被拒绝。吸附后会读取目标窗口的路径和一份有限的内容：文件管理器提供当前目录和文件名，代码编辑器提供当前文件路径和开头文本，终端提供命令提示符里的目录和前台命令。浏览器通常只能提供窗口标题；地址只有在辅助功能接口暴露时才会附上。这些上下文会随消息发给 Codex，识别到的目录会作为本次会话的工作目录。密钥样式的文件名不会被读入提示。当前版本需要 X11，会在 GNOME 登录后启动，不是系统开机后、登录前运行的后台服务。
 

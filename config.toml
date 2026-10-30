@@ -1,0 +1,96 @@
+# Orbit 配置
+# 改完后重新启动 Orbit 才会生效。
+# 设置窗口里保存过的工作目录、回复来源和接口会写到
+# ~/.config/orbit-codex/settings.json，并覆盖下面同名的默认值。
+# 吉祥物大小、对话窗口初始尺寸、颜色和快捷提问只由这个文件决定。
+# 访问令牌不要写在这里，放在 token_file 指向的文件里，默认是项目目录下的 api.txt。
+
+[app]
+name = "Orbit"
+version = "0.1.0"
+
+[mascot]
+# 整体大小。1.0 是现在这套外观，1.4 大约放大四成，0.8 缩小两成。
+# 可用范围 0.35 到 3。画布会跟着变大，避免吉祥物被裁切。
+scale = 1.0
+
+[chat]
+# 对话卡片第一次打开时的尺寸，以及可以拖到的最小、最大尺寸。
+width = 374
+height = 494
+min_width = 320
+min_height = 420
+max_width = 820
+max_height = 900
+
+[tether]
+# 从顶部把吉祥物拉出这么多像素后，连接带断开。
+break_distance = 220
+
+[api]
+# 默认回复来源：codex 使用本机 Codex CLI，api 使用下面的 Chat Completions 接口。
+provider = "codex"
+endpoint = ""
+model = ""
+# 存放访问令牌的文件。相对路径相对于本配置文件所在目录。
+token_file = "api.txt"
+timeout_seconds = 90
+# 一轮对话里最多连续调用几次工具。
+max_rounds = 8
+# 带给接口的历史消息条数。0 表示不带历史。
+history_messages = 20
+
+[codex]
+# 本机 Codex 多久没有新进度就判定卡住，单位毫秒。
+watchdog_ms = 120000
+client_name = "orbit_desktop"
+client_title = "Orbit Desktop"
+
+[workspace]
+# 还没有吸附到窗口时使用的目录。留空表示用户主目录。
+default_cwd = ""
+
+[behavior]
+# 这些是第一次运行、以及设置里还没保存过时的默认值。
+attach = true
+auto_open = true
+hints = true
+# 吸附后跟随窗口、以及重新扫描桌面窗口的间隔，单位毫秒。
+follow_ms = 200
+scan_ms = 700
+
+[context]
+# 读给模型的文本长度，以及目录里最多列出多少项。
+preview_chars = 6000
+selected_preview_chars = 4000
+directory_limit = 60
+
+[tools]
+shell_timeout = 30
+fetch_timeout = 20
+list_limit = 200
+
+[accent]
+files = "#7869d9"
+editor = "#6684dc"
+browser = "#d8966f"
+terminal = "#2f9d86"
+other = "#8370da"
+
+[prompts.files]
+items = ["这个文件夹里有什么？", "帮我整理这些文件", "找出需要处理的文件"]
+
+[prompts.editor]
+items = ["解释当前文件", "检查可能的问题", "基于这个文件继续改"]
+
+[prompts.browser]
+items = ["总结当前页面", "提炼三个要点", "我下一步该看什么？"]
+
+[prompts.terminal]
+items = ["当前目录在做什么？", "解释正在运行的命令", "下一步该运行什么？"]
+
+[prompts.other]
+items = ["这个窗口是做什么的？", "给我下一步建议", "帮我处理手头的事"]
+
+[prompts.idle]
+items = ["聊聊今天的计划", "给我一个灵感", "你能做什么？"]

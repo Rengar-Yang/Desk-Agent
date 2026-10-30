@@ -15,7 +15,15 @@ command -v xprop >/dev/null
 command -v xwininfo >/dev/null
 
 mkdir -p "$INSTALL_ROOT" "$APPLICATIONS_DIR" "$AUTOSTART_DIR"
+rm -rf "$INSTALL_ROOT/orbit"
+cp -a "$APP_ROOT/orbit" "$INSTALL_ROOT/orbit"
+find "$INSTALL_ROOT/orbit" -depth -type d -name __pycache__ -exec rm -rf {} +
 install -m 755 "$APP_ROOT/native_app.py" "$INSTALL_ROOT/native_app.py"
+if [ -f "$INSTALL_ROOT/config.toml" ]; then
+  echo "保留已有配置：$INSTALL_ROOT/config.toml"
+else
+  install -m 644 "$APP_ROOT/config.toml" "$INSTALL_ROOT/config.toml"
+fi
 if [ -f "$APP_ROOT/api.txt" ]; then
   ln -sfn "$APP_ROOT/api.txt" "$INSTALL_ROOT/api.txt"
 fi
