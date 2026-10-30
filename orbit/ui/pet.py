@@ -6,7 +6,6 @@ import os
 import random
 import threading
 import time
-import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -16,6 +15,7 @@ from PyQt5.QtCore import (
 from PyQt5.QtGui import QColor, QCursor, QPainter, QPen, QPolygon, QRegion
 from PyQt5.QtWidgets import QApplication, QDialog, QMenu, QMessageBox, QWidget
 
+from orbit.agent.api_client import ApiError, CancelledApi, RetryableApiError, request_completion
 from orbit.agent.codex import CodexBridge
 from orbit.agent.tools import API_TOOLS, api_error_text, kill_running_shell, run_tool, tool_label
 from orbit.config import get_config, load_api_token, load_user_settings, save_api_token, save_user_settings
@@ -40,6 +40,7 @@ class ContextBridge(QObject):
 
 class Pet(QWidget):
     api_result = pyqtSignal(int, object)
+    api_progress = pyqtSignal(int, str)
     tool_log = pyqtSignal(str, str)
     tools_ready = pyqtSignal(int, object, object)
     confirm_request = pyqtSignal()
@@ -73,6 +74,7 @@ class Pet(QWidget):
         self.api_tool_running = False
         self.api_history = []
         self.api_result.connect(self.api_finished)
+        self.api_progress.connect(self.on_api_progress)
         self.tool_log.connect(self.on_tool_log)
         self.tools_ready.connect(self.on_tools_ready)
         self.confirm_request.connect(self._confirm_on_gui, Qt.BlockingQueuedConnection)
@@ -147,6 +149,13 @@ class Pet(QWidget):
         self.motion = QTimer(self)
         self.motion.timeout.connect(self.animate_pet)
         self.motion.start(16)
+        self.activity_started = None
+        self.activity_touch = None
+        self.activity_label = ""
+        self.activity_warned = False
+        self.activity_timer = QTimer(self)
+        self.activity_timer.timeout.connect(self._tick_activity)
+        self.activity_timer.start(1000)
         screen = QApplication.primaryScreen().availableGeometry()
         self.home = QPoint(screen.center().x() - self.width() // 2, screen.top() - self.pad)
         self.move(self.home)
@@ -250,9 +259,9 @@ class Pet(QWidget):
         elif self.mood == "dragging":
             sx, sy = 1.06 + .04 * wave(.68), .94 + .04 * (1 - wave(.68))
         elif self.mood == "thinking":
-            y, sx, sy = -3 * wave(1.1), 1 + .03 * wave(1.1), 1 - .04 * wave(1.1)
+            y, sx, sy = -5 * wave(.9), 1 + .05 * wave(.9), 1 - .06 * wave(.9)
         elif self.mood == "working":
-            y, sx, sy = 2 * wave(.48), 1 + .04 * wave(.48), 1 - .05 * wave(.48)
+            y, sx, sy = 3 * wave(.42), 1 + .06 * wave(.42), 1 - .08 * wave(.42)
         idle_progress = max(0., min(1., 1 - (self.idle_until - time.monotonic()) / .9))
         idle_wave = math.sin(idle_progress * math.pi) if time.monotonic() < self.idle_until else 0.
         if self.mood == "idle" and self.idle_kind == "hop":
@@ -630,6 +639,7 @@ class Pet(QWidget):
                     QTimer.singleShot(260, self.open_chat)
             elif self.target:
                 self.cancel_api()
+                self.end_activity()
                 self.api_history.clear()
                 self.bridge.invalidate()
                 self.chat.set_context(self.target)
@@ -651,6 +661,7 @@ class Pet(QWidget):
                 self.context_pending = False
                 self.pending_message = None
                 self.cancel_api()
+                self.end_activity()
                 self.api_history.clear()
                 self.bridge.invalidate()
                 self.chat.set_context(None)
@@ -734,6 +745,7 @@ class Pet(QWidget):
 
     def clear_conversation(self):
         self.cancel_api()
+        self.end_activity()
         self.pending_message = None
         self.api_history.clear()
         self.bridge.invalidate()
@@ -747,6 +759,7 @@ class Pet(QWidget):
         self.context_pending = False
         self.pending_message = None
         self.cancel_api()
+        self.end_activity()
         self.api_history.clear()
         self.bridge.invalidate()
         self.target = None
@@ -847,13 +860,53 @@ class Pet(QWidget):
             return str(fallback)
         return str(Path.home())
 
+    def begin_activity(self, label):
+        """Show a live timer and the working animation until the task ends."""
+        now = time.monotonic()
+        self.activity_started = now
+        self.activity_touch = now
+        self.activity_label = label
+        self.activity_warned = False
+        self.chat.set_busy_status(label, 0)
+        self.set_mood("thinking")
+
+    def touch_activity(self, label=None, working=False):
+        if self.activity_started is None:
+            self.begin_activity(label or "正在处理…")
+            return
+        self.activity_touch = time.monotonic()
+        self.activity_warned = False
+        if label:
+            self.activity_label = label
+        elapsed = int(time.monotonic() - self.activity_started)
+        self.chat.set_busy_status(self.activity_label, elapsed)
+        self.set_mood("working" if working else "thinking")
+
+    def end_activity(self):
+        self.activity_started = None
+        self.activity_touch = None
+        self.activity_warned = False
+
+    def _tick_activity(self):
+        if self.activity_started is None:
+            return
+        elapsed = int(time.monotonic() - self.activity_started)
+        quiet = time.monotonic() - self.activity_touch
+        stalled = quiet >= 90
+        self.chat.set_busy_status(self.activity_label, elapsed, stalled=stalled)
+        if self.mood == "idle":
+            self.set_mood("thinking")
+        if stalled and not self.activity_warned:
+            self.activity_warned = True
+            self.chat.append("Orbit", "已经有一会儿没有新进展。任务可能卡住了，可以点「结束任务」停下来。")
+
     def ask(self, message):
         if self.target and self.context_pending:
             self.pending_message = message
-            self.chat.status.setText("正在读取窗口路径…")
+            self.begin_activity("正在读取窗口路径")
             return
+        self.begin_activity("正在准备")
         self.set_mood("thinking")
-        QTimer.singleShot(500, lambda: self.set_mood("working") if not self.chat.send_button.isEnabled() else None)
         if self.settings.get("provider") == "api":
             self.ask_api(message)
             return
@@ -877,6 +930,7 @@ class Pet(QWidget):
         self.api_generation += 1
         self.api_round = 0
         self.api_user_message = message
+        self.touch_activity("正在等待模型回复")
         context = (
             "你是 Orbit 桌面助手，用中文回复。需要查看或修改文件时调用工具，不要假装已经读过或改过。"
             "写入文件和运行命令会先请用户确认。敏感文件会读取失败。浏览器没有正文时，用 fetch_url 读取 http 或 https 地址。\n"
@@ -890,8 +944,9 @@ class Pet(QWidget):
     def post_api(self, messages):
         self.api_messages = messages
         self.api_inflight = True
-        body = {"model": self.settings["model"], "messages": messages, "tools": API_TOOLS, "stream": False}
-        self.chat.status.setText("API 正在请求…")
+        body = {"model": self.settings["model"], "messages": messages, "tools": API_TOOLS}
+        waiting = "正在等待模型继续" if self.api_round else "正在等待模型回复"
+        self.touch_activity(waiting)
         threading.Thread(
             target=self._post_api,
             args=(self.api_generation, self.api_user_message, self.settings.get("endpoint", "").strip(), self.api_token, body),
@@ -899,16 +954,43 @@ class Pet(QWidget):
         ).start()
 
     def _post_api(self, generation, message, url, token, body):
-        headers = {"Content-Type": "application/json"}
-        if token:
-            headers["Authorization"] = "Bearer " + token
-        request = urllib.request.Request(url, data=json.dumps(body, ensure_ascii=False).encode(), headers=headers, method="POST")
-        try:
-            with urllib.request.urlopen(request, timeout=get_config().api.timeout_seconds) as response:
-                payload = response.read()
-            self.api_result.emit(generation, {"ok": True, "message": message, "body": payload})
-        except Exception as error:
-            self.api_result.emit(generation, {"ok": False, "error": api_error_text(error)})
+        # Silence longer than this ends one attempt. Streaming usually sends
+        # bytes well before then, and a dropped attempt is sent again.
+        timeout = max(get_config().api.timeout_seconds, 180)
+        attempts = 4
+        for attempt in range(attempts):
+            if generation != self.api_generation:
+                return
+            try:
+                assistant = request_completion(
+                    url, token, body, timeout,
+                    on_progress=lambda label: self.api_progress.emit(generation, label),
+                    cancelled=lambda: generation != self.api_generation,
+                )
+            except CancelledApi:
+                return
+            except RetryableApiError as error:
+                if attempt + 1 >= attempts or generation != self.api_generation:
+                    self.api_result.emit(generation, {"ok": False, "error": str(error)})
+                    return
+                self.api_progress.emit(generation, "响应中断了，正在重新请求，任务会继续")
+                time.sleep(1.2)
+                continue
+            except ApiError as error:
+                self.api_result.emit(generation, {"ok": False, "error": str(error)})
+                return
+            except Exception as error:
+                self.api_result.emit(generation, {"ok": False, "error": api_error_text(error)})
+                return
+            if generation != self.api_generation:
+                return
+            self.api_result.emit(generation, {"ok": True, "message": message, "assistant": assistant})
+            return
+
+    def on_api_progress(self, generation, label):
+        if generation != self.api_generation or self.activity_started is None or self.api_tool_running:
+            return
+        self.touch_activity(label, working=("操作" in label or "执行" in label))
 
     def api_finished(self, generation, result):
         if generation != self.api_generation:
@@ -918,8 +1000,7 @@ class Pet(QWidget):
             self.on_error("API 请求失败：" + result.get("error", "未知错误"))
             return
         try:
-            data = json.loads(result["body"].decode("utf-8"))
-            message_obj = data["choices"][0]["message"] or {}
+            message_obj = result.get("assistant") or {}
             tool_calls = message_obj.get("tool_calls") or []
             if tool_calls and self.api_round < get_config().api.max_rounds:
                 self.continue_tools(message_obj, tool_calls)
@@ -939,6 +1020,7 @@ class Pet(QWidget):
         self.api_round += 1
         generation = self.api_generation
         self.api_tool_running = True
+        self.touch_activity("正在执行操作", working=True)
         root = self.working_directory()
         blocked = bool(self.target and not self.target.get("path"))
         content = message_obj.get("content") or ""
@@ -967,8 +1049,7 @@ class Pet(QWidget):
 
     def on_tool_log(self, author, text):
         self.chat.append(author, text)
-        self.chat.status.setText(text)
-        self.set_mood("working")
+        self.touch_activity(text, working=True)
 
     def on_tools_ready(self, generation, assistant, follow):
         if generation != self.api_generation:
@@ -1003,15 +1084,17 @@ class Pet(QWidget):
 
     def stop_reply(self):
         self.pending_message = None
+        self.context_pending = False
+        self.context_token += 1
         kill_running_shell()
-        if self.api_inflight or self.api_tool_running:
-            self.cancel_api()
-            self.on_finished("已停止")
-            self.chat.status.setText("已停止")
-        else:
-            self.bridge.stop()
+        self.cancel_api()
+        self.bridge.stop()
+        self.end_activity()
+        self.on_finished("已结束这次任务。")
+        self.chat.status.setText("已结束任务")
 
     def on_error(self, message):
+        self.end_activity()
         self.chat.status.setText(message)
         if self.chat.isVisible():
             self.chat.append("错误", message)
@@ -1021,11 +1104,14 @@ class Pet(QWidget):
         self.set_mood("idle")
 
     def on_status(self, message):
-        self.chat.status.setText(message)
-        if "思考" in message: self.set_mood("thinking")
-        elif "回复" in message or "执行" in message: self.set_mood("working")
+        if self.activity_started is None:
+            return
+        self.touch_activity(message, working=("执行" in message or "回复" in message or "操作" in message))
 
     def on_finished(self, text):
+        if self.activity_started is None and self.chat.send_button.isEnabled() and not self.chat.streaming:
+            return
+        self.end_activity()
         self.chat.finish(text)
         self.set_mood("done")
         QTimer.singleShot(1500, lambda: self.set_mood("idle") if self.chat.send_button.isEnabled() else None)

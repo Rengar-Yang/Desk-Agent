@@ -35,7 +35,8 @@ endpoint = ""
 model = ""
 # 存放访问令牌的文件。相对路径相对于本配置文件所在目录。
 token_file = "api.txt"
-timeout_seconds = 90
+# 两次收到数据之间最多空等多久。流式响应会在模型输出时不断刷新这段时间。
+timeout_seconds = 180
 # 一轮对话里最多连续调用几次工具。
 max_rounds = 8
 # 带给接口的历史消息条数。0 表示不带历史。

@@ -35,6 +35,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    icon=str(Path(SPECPATH) / "orbit.ico"),
     manifest=str(Path(SPECPATH) / "orbit.exe.manifest"),
 )
 coll = COLLECT(

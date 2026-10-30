@@ -193,8 +193,14 @@ class CodexBridge(QWidget):
         self.active_turn = message.get("result", {}).get("turn", {}).get("id")
 
     def stop(self):
-        if self.active_turn and self.thread_id:
-            self.send("turn/interrupt", {"threadId": self.thread_id, "turnId": self.active_turn})
+        """Drop the current turn so a late completion cannot unlock a newer task."""
+        self.generation += 1
+        turn = self.active_turn
+        thread = self.thread_id
+        self.active_turn = None
+        self.watchdog.stop()
+        if turn and thread and self.process.state() != QProcess.NotRunning:
+            self.send("turn/interrupt", {"threadId": thread, "turnId": turn})
 
     def read_output(self):
         self.buffer += bytes(self.process.readAllStandardOutput())

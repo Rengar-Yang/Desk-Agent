@@ -3,7 +3,7 @@
 import time
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor
+from PyQt5.QtGui import QColor, QPixmap
 from PyQt5.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QScrollArea, QSizeGrip, QSizePolicy, QVBoxLayout, QWidget,
 )
@@ -12,6 +12,7 @@ from orbit.config import get_config
 from orbit.theme import ACCENTS, CONTEXT_PROMPTS, KIND_LABELS
 from orbit.ui.fonts import ui_font, ui_font_css
 from orbit.ui.markdown import markdown_to_html
+from orbit.ui.mascot_icon import render_mascot
 
 
 class ChatWindow(QWidget):
@@ -41,9 +42,10 @@ class ChatWindow(QWidget):
         root.setContentsMargins(17, 16, 17, 12)
         root.setSpacing(10)
         header = QHBoxLayout()
-        self.icon = QLabel("✦")
+        self.icon = QLabel()
         self.icon.setFixedSize(36, 36)
         self.icon.setAlignment(Qt.AlignCenter)
+        self.icon.setPixmap(QPixmap.fromImage(render_mascot(36)))
         header.addWidget(self.icon)
         heading = QVBoxLayout()
         heading.setSpacing(1)
@@ -93,7 +95,7 @@ class ChatWindow(QWidget):
         root.addLayout(self.prompts)
         self.status = QLabel(f"{self.backend_label} · 点击发送以连接")
         self.status.setWordWrap(True)
-        self.status.setMaximumHeight(40)
+        self.status.setMaximumHeight(64)
         self.status.setObjectName("status")
         root.addWidget(self.status)
         composer = QHBoxLayout()
@@ -117,7 +119,8 @@ class ChatWindow(QWidget):
         self.size_grip = QSizeGrip(self)
         self.size_grip.setObjectName("sizeGrip")
         footer.addWidget(self.size_grip)
-        self.stop_button = QPushButton("停止")
+        self.stop_button = QPushButton("结束任务")
+        self.stop_button.setObjectName("stopButton")
         self.stop_button.clicked.connect(self.stop.emit)
         self.stop_button.hide()
         footer.addWidget(self.stop_button)
@@ -152,6 +155,8 @@ class ChatWindow(QWidget):
             QPushButton:hover {{ background: #e4def5; }}
             #sendButton {{ background: {accent}; color: #fff; font-size: 17px; font-weight: 700; }}
             #closeButton {{ background: transparent; color: #89849b; font-size: 20px; }}
+            #stopButton {{ background: #f3e4e8; color: #8d3d4a; font-weight: 600; }}
+            #stopButton:hover {{ background: #ead4da; }}
             #sizeGrip {{ background: transparent; width: 14px; height: 14px; }}
             #messageArea, #messageArea QWidget {{ border: 0; background: #fdfdff; }}
             #messageArea QScrollBar:vertical {{ background: transparent; width: 8px; margin: 4px 2px 4px 0; }}
@@ -160,7 +165,8 @@ class ChatWindow(QWidget):
             #messageArea QScrollBar::add-line:vertical, #messageArea QScrollBar::sub-line:vertical {{ height: 0; width: 0; background: transparent; border: 0; }}
             #messageArea QScrollBar::add-page:vertical, #messageArea QScrollBar::sub-page:vertical {{ background: transparent; }}
         """)
-        self.icon.setStyleSheet(f"background: {banner}; color: {accent}; border-radius: 10px; font-size: 18px;")
+        self.icon.setPixmap(QPixmap.fromImage(render_mascot(36)))
+        self.icon.setStyleSheet("background: transparent;")
 
     def set_context(self, target):
         while self.prompts.count():
@@ -258,6 +264,16 @@ class ChatWindow(QWidget):
         self.current_bubble.raw_text += text
         self.render_bubble(self.current_bubble)
         QTimer.singleShot(0, lambda: self.area.verticalScrollBar().setValue(self.area.verticalScrollBar().maximum()))
+
+    def set_busy_status(self, label, elapsed, stalled=False):
+        dots = "·" * ((elapsed % 3) + 1)
+        text = f"{label} {dots}  已进行 {elapsed} 秒"
+        if stalled:
+            text += "  ·  可能卡住了，可结束任务"
+        self.status.setText(text)
+        self.stop_button.setText("结束任务")
+        self.stop_button.show()
+        self.send_button.setEnabled(False)
 
     def finish(self, text):
         if not self.streaming: self.append("Codex", text)

@@ -9,6 +9,9 @@ if (-not [Environment]::Is64BitProcess) {
     throw "请用 64 位 PowerShell 和 64 位 Python 3.11 或更高版本运行此脚本。"
 }
 
+Write-Host "生成吉祥物图标..."
+python -c "import sys; from pathlib import Path; from PyQt5.QtWidgets import QApplication; from orbit.ui.mascot_icon import write_ico; QApplication(sys.argv); write_ico(Path('packaging') / 'orbit.ico')"
+
 Write-Host "安装打包依赖..."
 python -m pip install -r (Join-Path $packaging "requirements-windows.txt")
 

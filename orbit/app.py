@@ -10,6 +10,7 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 
 from orbit.config import CONFIG_DIR
 from orbit.ui.fonts import apply_app_font
+from orbit.ui.mascot_icon import app_icon
 from orbit.ui.pet import Pet
 
 
@@ -57,6 +58,7 @@ def main():
         enable_input_method()
     app = QApplication(sys.argv)
     apply_app_font(app)
+    app.setWindowIcon(app_icon())
     instance_lock = QLockFile(lock_path())
     app._instance_lock = instance_lock
     if not instance_lock.tryLock(0):
