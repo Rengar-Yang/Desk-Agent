@@ -1,7 +1,8 @@
-"""Start one Orbit instance on an X11 session."""
+"""Start one Orbit instance on the current desktop."""
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 
 from PyQt5.QtCore import QLockFile, QProcess
@@ -37,13 +38,25 @@ def enable_input_method():
             return
     os.environ["QT_IM_MODULE"] = "xim"
 
+def lock_path():
+    if os.name == "nt":
+        return str(Path(tempfile.gettempdir()) / "orbit-codex.lock")
+    return f"/tmp/orbit-codex-{os.getuid()}.lock"
+
+
 def main():
-    if not os.environ.get("DISPLAY"):
-        print("Orbit 当前需要 X11 桌面会话。", file=sys.stderr)
-        return 1
-    enable_input_method()
+    if os.name == "nt":
+        from PyQt5.QtCore import Qt
+        from orbit.desktop.win32 import prepare_dpi
+        prepare_dpi(Qt, QApplication)
+    else:
+        if not os.environ.get("DISPLAY"):
+            print("Orbit 当前需要 X11 桌面会话。", file=sys.stderr)
+            return 1
+        enable_input_method()
     app = QApplication(sys.argv)
-    instance_lock = QLockFile(f"/tmp/orbit-codex-{os.getuid()}.lock")
+    instance_lock = QLockFile(lock_path())
+    app._instance_lock = instance_lock
     if not instance_lock.tryLock(0):
         QMessageBox.information(None, "Orbit", "Orbit 已在运行。请先退出旧进程，再启动更新后的版本。")
         return 0

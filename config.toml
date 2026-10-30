@@ -1,13 +1,14 @@
 # Orbit 配置
 # 改完后重新启动 Orbit 才会生效。
-# 设置窗口里保存过的工作目录、回复来源和接口会写到
-# ~/.config/orbit-codex/settings.json，并覆盖下面同名的默认值。
+# 设置窗口里保存过的工作目录、回复来源和接口会覆盖下面同名的默认值。
+# Linux 写到 ~/.config/orbit-codex/settings.json。
+# Windows 写到 %APPDATA%\orbit-codex\settings.json。
 # 吉祥物大小、对话窗口初始尺寸、颜色和快捷提问只由这个文件决定。
 # 访问令牌不要写在这里，放在 token_file 指向的文件里，默认是项目目录下的 api.txt。
 
 [app]
 name = "Orbit"
-version = "0.1.0"
+version = "0.2.0"
 
 [mascot]
 # 整体大小。1.0 是现在这套外观，1.4 大约放大四成，0.8 缩小两成。

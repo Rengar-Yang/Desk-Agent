@@ -18,6 +18,19 @@ def find_codex():
     found = shutil.which("codex")
     if found:
         return found
+    if os.name == "nt":
+        found = shutil.which("codex.cmd")
+        if found:
+            return found
+        local = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            Path.home() / "AppData" / "Roaming" / "npm" / "codex.cmd",
+            Path(local) / "Programs" / "codex" / "codex.exe" if local else None,
+        ]
+        for candidate in candidates:
+            if candidate and candidate.is_file():
+                return str(candidate)
+        return None
     candidates = sorted((Path.home() / ".nvm" / "versions" / "node").glob("*/bin/codex"))
     return str(candidates[-1]) if candidates else None
 
@@ -80,14 +93,18 @@ class CodexBridge(QWidget):
             self.error.emit("找不到本机 codex 命令。请先安装并登录 Codex CLI。")
             return
         self.status.emit("正在连接本机 Codex…")
-        self.process.setProgram(codex)
         environment = QProcessEnvironment.systemEnvironment()
         environment.insert("PATH", str(Path(codex).parent) + os.pathsep + environment.value("PATH"))
         self.process.setProcessEnvironment(environment)
         self.stderr_tail = ""
         self.buffer = b""
         self.callbacks.clear()
-        self.process.setArguments(["app-server", "--listen", "stdio://"])
+        if os.name == "nt" and codex.lower().endswith((".cmd", ".bat")):
+            self.process.setProgram(os.environ.get("COMSPEC", "cmd.exe"))
+            self.process.setArguments(["/d", "/c", codex, "app-server", "--listen", "stdio://"])
+        else:
+            self.process.setProgram(codex)
+            self.process.setArguments(["app-server", "--listen", "stdio://"])
         self.process.setWorkingDirectory(str(Path.home()))
         self.process.start()
         self.send("initialize", {"clientInfo": {"name": get_config().codex.client_name, "title": get_config().codex.client_title, "version": get_config().app.version}}, self.initialized)

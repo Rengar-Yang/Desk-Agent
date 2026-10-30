@@ -1,15 +1,15 @@
-"""Poll X11 off the UI thread so the mascot keeps its frame time."""
+"""Poll desktop windows off the UI thread so the mascot keeps its frame time."""
 
 import threading
 import time
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from orbit.desktop.x11 import query_window_rect, query_windows, window_is_covered
+from orbit.desktop.session import query_window_rect, query_windows, window_is_covered
 
 
 class WindowProbe(QObject):
-    """Poll X11 off the UI thread so the mascot animation keeps its frame time."""
+    """Poll desktop windows off the UI thread so the mascot animation keeps its frame time."""
 
     found = pyqtSignal(int, object)
     placed = pyqtSignal(str, object)

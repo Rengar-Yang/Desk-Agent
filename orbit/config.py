@@ -2,13 +2,40 @@
 
 import json
 import os
+import sys
 import tomllib
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "orbit-codex"
+
+def _source_root():
+    return Path(__file__).resolve().parent.parent
+
+
+def _runtime_root():
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return _source_root()
+
+
+def _config_dir():
+    if os.name == "nt":
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "orbit-codex"
+    return Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config"))) / "orbit-codex"
+
+
+def _config_file():
+    preferred = _runtime_root() / "config.toml"
+    if preferred.is_file():
+        return preferred
+    bundled = _source_root() / "config.toml"
+    return bundled if bundled.is_file() else preferred
+
+
+ROOT = _runtime_root()
+CONFIG_DIR = _config_dir()
 CONFIG_FILE = CONFIG_DIR / "settings.json"
-APP_CONFIG_FILE = ROOT / "config.toml"
+APP_CONFIG_FILE = _config_file()
 
 # The painted mascot was designed at this scale inside a 112×118 canvas.
 # config.toml scale is a multiplier on that current appearance.
@@ -175,7 +202,7 @@ def load_api_token():
     """Read a bearer token from the configured file, then the user config dir."""
     token_path = Path(get_config().api.token_file).expanduser()
     if not token_path.is_absolute():
-        token_path = ROOT / token_path
+        token_path = APP_CONFIG_FILE.parent / token_path
     candidates = [token_path, CONFIG_DIR / token_path.name]
     seen = set()
     for path in candidates:

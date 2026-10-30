@@ -102,7 +102,7 @@ def resolve_path_buttons(names):
     return Path(current)
 
 def unique_directory_named(name):
-    if not name or len(name) > 180 or "/" in name:
+    if not name or len(name) > 180 or "/" in name or "\\" in name or ":" in name:
         return None
     home = Path.home()
     matches = []

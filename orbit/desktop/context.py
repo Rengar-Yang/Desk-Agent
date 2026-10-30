@@ -13,30 +13,51 @@ from orbit.desktop.accessibility import accessibility_snapshot
 from orbit.desktop.files import (
     SKIP_DIRS, list_directory, read_text_preview, resolve_path_buttons, unique_directory_named,
 )
-from orbit.desktop.x11 import classify_window
+from orbit.desktop.common import classify_window
 from orbit.theme import ACCENTS, KIND_LABELS
 
-SHELLS = {"bash", "zsh", "fish", "sh", "dash"}
+SHELL_NAMES = {"bash", "zsh", "fish", "sh", "dash", "cmd", "powershell", "pwsh"}
+
+def _is_shell(comm):
+    name = (comm or "").lower()
+    if name.endswith(".exe"):
+        name = name[:-4]
+    return name in SHELL_NAMES
+
+
+def _same_path(left, right):
+    if not left or not right:
+        return False
+    return os.path.normcase(os.path.normpath(left)) == os.path.normcase(os.path.normpath(right))
+
+
+def _windows_path(raw):
+    if len(raw) >= 3 and raw[1] == ":" and raw[2] in ("\\", "/"):
+        return True
+    return raw.startswith("\\\\")
+
 
 def parse_terminal_cwd(title):
-    match = re.match(r"^[^@\s]+@[^:]+:\s*(.+)$", title.strip())
-    if not match:
-        return None
-    raw = match.group(1).strip()
-    if not (raw.startswith("~") or raw.startswith("/")):
+    text = title.strip().strip('"')
+    match = re.match(r"^[^@\s]+@[^:]+:\s*(.+)$", text)
+    raw = match.group(1).strip() if match else text
+    if not (raw.startswith("~") or raw.startswith("/") or _windows_path(raw)):
         return None
     path = Path(raw).expanduser()
     return path if path.is_dir() else None
 
 
 def parse_editor_title(title):
-    cleaned = re.sub(r"\s+[—–-]\s+(Cursor|Visual Studio Code|Code|VSCodium|Text Editor|gedit|Kate)$", "", title).strip()
-    located = re.search(r"\((~?[/~][^)]+)\)\s*$", cleaned)
+    cleaned = re.sub(
+        r"\s+[—–-]\s+(Cursor|Visual Studio Code|Code|VSCodium|Text Editor|gedit|Kate|Notepad\+\+|Notepad)$",
+        "", title,
+    ).strip()
+    located = re.search(r"\((~?[/~][^)]+|[A-Za-z]:\\[^)]+)\)\s*$", cleaned)
     path = Path(located.group(1)).expanduser() if located and Path(located.group(1)).expanduser().exists() else None
     parts = [part.strip() for part in re.split(r"\s+[—–-]\s+", cleaned) if part.strip()]
     filename = parts[0] if parts else None
     workspace = parts[1] if len(parts) > 1 else None
-    if filename and "/" in filename:
+    if filename and ("/" in filename or "\\" in filename):
         filename = Path(filename).name
     return filename, workspace, path
 
@@ -45,7 +66,10 @@ def file_uri_to_path(uri):
     if not uri:
         return None
     if uri.startswith("file:"):
-        return Path(unquote(urlparse(uri).path))
+        path = unquote(urlparse(uri).path)
+        if os.name == "nt" and len(path) >= 3 and path[0] == "/" and path[2] == ":":
+            path = path[1:]
+        return Path(path)
     return Path(uri)
 
 
@@ -69,11 +93,19 @@ def code_workspace_folders(path):
 
 def editor_roots():
     roots = []
+    home = Path.home()
     bases = [
-        Path.home() / ".config" / "Cursor" / "User" / "workspaceStorage",
-        Path.home() / ".config" / "Code" / "User" / "workspaceStorage",
-        Path.home() / ".config" / "Code - OSS" / "User" / "workspaceStorage",
+        home / ".config" / "Cursor" / "User" / "workspaceStorage",
+        home / ".config" / "Code" / "User" / "workspaceStorage",
+        home / ".config" / "Code - OSS" / "User" / "workspaceStorage",
     ]
+    if os.name == "nt":
+        appdata = Path(os.environ.get("APPDATA", str(home / "AppData" / "Roaming")))
+        bases.extend([
+            appdata / "Cursor" / "User" / "workspaceStorage",
+            appdata / "Code" / "User" / "workspaceStorage",
+            appdata / "Code - OSS" / "User" / "workspaceStorage",
+        ])
     for base in bases:
         if not base.is_dir():
             continue
@@ -133,6 +165,9 @@ def locate_editor_file(title):
 
 
 def process_table():
+    if os.name == "nt":
+        from orbit.desktop.win32 import windows_process_table
+        return windows_process_table()
     table = {}
     children = {}
     for entry in Path("/proc").iterdir():
@@ -169,8 +204,8 @@ def descendant_shell_cwd(pid):
             continue
         seen.add(current)
         stack.extend(children.get(current, []))
-        if table[current]["comm"] in SHELLS and table[current]["cwd"]:
-            cwds.append(table[current]["cwd"])
+        if _is_shell(table[current]["comm"]) and table[current]["cwd"]:
+            cwds.append(os.path.normcase(os.path.normpath(table[current]["cwd"])))
     unique = set(cwds)
     if len(unique) == 1:
         path = Path(next(iter(unique)))
@@ -193,14 +228,14 @@ def foreground_commands(root_pid, cwd, limit=4):
             continue
         seen.add(pid)
         info = table[pid]
-        if info["comm"] in SHELLS and info["cwd"] == target:
+        if _is_shell(info["comm"]) and _same_path(info["cwd"], target):
             shells.append(pid)
         stack.extend(children.get(pid, []))
     lines = []
     for shell in shells:
         for pid in children.get(shell, []):
             info = table.get(pid)
-            if not info or info["cwd"] != target or not info["cmd"]:
+            if not info or not _same_path(info["cwd"], target) or not info["cmd"]:
                 continue
             text = re.sub(r"\s+", " ", info["cmd"])[:160]
             if text not in lines:
@@ -216,13 +251,21 @@ def capture_context(window):
     rect = window.get("rect") or (0, 0, 0, 0)
     if isinstance(rect, QRect):
         rect = (rect.x(), rect.y(), rect.width(), rect.height())
-    snapshot = accessibility_snapshot(window.get("pid"), title, rect) if kind in ("files", "browser", "editor") else {}
+    if os.name != "nt" and kind in ("files", "browser", "editor"):
+        snapshot = accessibility_snapshot(window.get("pid"), title, rect)
+    else:
+        snapshot = {}
     path = None
     entries = []
     preview = None
     detail = ""
     if kind == "files":
-        path = resolve_path_buttons(snapshot.get("buttons") or [])
+        folder = window.get("folder")
+        path = Path(folder) if folder and Path(folder).is_dir() else None
+        if path is None:
+            path = resolve_path_buttons(snapshot.get("buttons") or [])
+        if path is None:
+            path = resolve_path_buttons([title])
         titled = unique_directory_named(title)
         if titled and (path is None or (path != titled and path in titled.parents)):
             path = titled
@@ -278,7 +321,7 @@ def context_prompt(window, cwd):
         return ""
     kind = KIND_LABELS.get(window.get("kind"), "窗口")
     lines = [
-        "你正在协助用户操作一个已经吸附的 Linux 窗口。请直接使用下面的路径和内容，不要再向用户索取路径或要求粘贴文件。",
+        "你正在协助用户操作一个已经吸附的桌面窗口。请直接使用下面的路径和内容，不要再向用户索取路径或要求粘贴文件。",
         f"窗口类型：{kind}",
         f"窗口标题：{window.get('title', '')}",
         f"程序：{window.get('app', '')}",

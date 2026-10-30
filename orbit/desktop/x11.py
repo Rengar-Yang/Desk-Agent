@@ -6,7 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from PyQt5.QtCore import QRect
+from orbit.desktop.common import classify_window, window_covers
 
 SKIPPED_WINDOW_TYPES = (
     "_NET_WM_WINDOW_TYPE_DESKTOP",
@@ -102,15 +102,6 @@ def outer_window_rect(values, props):
         return (x - left, y - top, width + left + right, height + top + bottom)
     return (x, y, width, height)
 
-def topmost_at(windows, point):
-    """Pick the uppermost visible window under a point. Lower layers stay hidden."""
-    for window in reversed(windows):
-        area = window.get("bounds") or window["rect"]
-        if area.contains(point):
-            return window
-    return None
-
-
 def visible_window_rect(values, props):
     """Exclude GTK client shadows; include server-drawn window decorations."""
     x, y = values["Absolute upper-left X"], values["Absolute upper-left Y"]
@@ -150,45 +141,6 @@ def unescape_xprop(text):
         return text.encode("utf-8").decode("unicode_escape").encode("latin-1").decode("utf-8")
     except (UnicodeError, ValueError):
         return text
-
-
-def classify_window(app_class):
-    app = app_class.lower()
-    if any(name in app for name in ("nautilus", "nemo", "thunar", "dolphin", "caja")):
-        return "files"
-    if any(name in app for name in ("terminal", "kitty", "alacritty", "wezterm", "konsole", "ptyxis")):
-        return "terminal"
-    if any(name in app for name in ("firefox", "chrome", "chromium", "brave", "msedge")):
-        return "browser"
-    if any(name in app for name in ("cursor", "code", "gedit", "kate", "sublime", "emacs", "texteditor")):
-        return "editor"
-    return "other"
-
-
-def hydrate_window(window):
-    hydrated = dict(window)
-    hydrated["rect"] = QRect(*window["rect"])
-    if window.get("bounds"):
-        hydrated["bounds"] = QRect(*window["bounds"])
-    return hydrated
-
-def window_covers(target, other):
-    """True when another window sits above the attached window and hides it."""
-    tx, ty, tw, th = target
-    ox, oy, ow, oh = other
-    if tw < 40 or th < 40 or ow < 80 or oh < 60:
-        return False
-    left, top = max(tx, ox), max(ty, oy)
-    right, bottom = min(tx + tw, ox + ow), min(ty + th, oy + oh)
-    if right - left < 80 or bottom - top < 48:
-        return False
-    perch_x, perch_y = tx + tw / 2, ty + 12
-    center_x, center_y = tx + tw / 2, ty + th / 2
-    covers_perch = ox <= perch_x <= ox + ow and oy <= perch_y <= oy + oh
-    covers_center = ox <= center_x <= ox + ow and oy <= center_y <= oy + oh
-    if covers_perch or covers_center:
-        return True
-    return (right - left) * (bottom - top) > 0.45 * tw * th
 
 
 def layer_rect(wid, own_ids, current_desktop):

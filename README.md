@@ -1,8 +1,8 @@
-# Orbit · Linux 桌面 Codex 助手
+# Orbit · 桌面 Codex 助手
 
-一个运行在 Ubuntu GNOME/X11 上的原生 Qt 桌宠。左键点击可和本机 Codex 聊天，拖到窗口上可吸附，右键可设置工作目录和登录自启动。原来的浏览器交互原型仍保留，便于查看设计。
+一个原生 Qt 桌宠。在 Ubuntu GNOME/X11 上可以直接安装；在 64 位 Windows 10 或更高版本上可以装进开始菜单，也可以打成安装包。左键点击可和本机 Codex 聊天，拖到窗口上可吸附，右键可设置工作目录和登录自启动。原来的浏览器交互原型仍保留，便于查看设计。
 
-## 安装桌面应用
+## 在 Linux 上安装
 
 需要 Python 3、PyQt5、`xprop`、`xwininfo` 和已登录的 Codex CLI。本机当前环境已具备这些组件。运行：
 
@@ -19,6 +19,34 @@
 python3 native_app.py
 ```
 
+## 在 Windows 上安装
+
+需要 64 位 Windows 10 或更高版本。窗口吸附使用系统窗口列表：文件资源管理器会读取当前文件夹，终端会读取其中 shell 的目录，Cursor 和 VS Code 会按窗口标题在最近的工作区里查找文件。浏览器通常只有窗口标题。
+
+不打包、直接用本机 Python 安装时，先安装 64 位 Python 3.11 或更高版本并加入 PATH，再在项目目录打开 PowerShell：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install-windows.ps1
+```
+
+脚本会安装 PyQt5，把程序复制到 `%LOCALAPPDATA%\Programs\Orbit`，并创建开始菜单快捷方式。加上 `-Autostart` 会同时写入登录启动项。右键吉祥物进入“设置”，也可以之后再开关自启动。卸载：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "$env:LOCALAPPDATA\Programs\Orbit\uninstall-windows.ps1"
+```
+
+也可以不安装，在项目目录执行 `python native_app.py`。
+
+要做成可以拷到其他电脑的安装包，在 Windows 上运行：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\packaging\build-windows.ps1
+```
+
+脚本会用 PyInstaller 打包，并调用 Inno Setup 6 生成 `dist\Orbit-Setup.exe`。如果还没有 Inno Setup，脚本会尝试用 winget 安装。把这个安装包拷到其他 Windows 电脑上双击即可安装，对方不需要预先安装 Python。安装程序可以选择桌面快捷方式和登录后自动启动。安装目录里的 `config.toml` 在升级时不会被覆盖；访问令牌放在同目录的 `api.txt`，或 `%APPDATA%\orbit-codex\api.txt`。
+
+这个仓库当前在 Linux 上，不能在这里直接编出 `.exe`。安装包需要在 Windows 上执行上面的脚本后才会出现。
+
 ## 配置
 
 项目根目录的 `config.toml` 控制吉祥物大小、对话窗口初始尺寸、默认接口、颜色和快捷提问。例如把吉祥物放大到 1.4 倍：
@@ -33,9 +61,9 @@ endpoint = "https://你的服务/v1/chat/completions"
 model = "你的模型"
 ```
 
-访问令牌仍放在 `api.txt`，不要写进配置。设置窗口保存过的目录和接口位于 `~/.config/orbit-codex/settings.json`，会覆盖配置文件里的同名默认值。修改 `config.toml` 后重新启动 Orbit。重新运行 `install.sh` 会更新程序，但不会覆盖已经安装过的那份 `config.toml`。
+访问令牌仍放在 `api.txt`，不要写进配置。设置窗口保存过的目录和接口，在 Linux 上位于 `~/.config/orbit-codex/settings.json`，在 Windows 上位于 `%APPDATA%\orbit-codex\settings.json`，会覆盖配置文件里的同名默认值。修改 `config.toml` 后重新启动 Orbit。重新运行 `install.sh` 会更新程序，但不会覆盖已经安装过的那份 `config.toml`。
 
-Codex 通过本机 `codex app-server` 运行，使用当前 Codex CLI 登录状态。每个工作目录会建立独立会话。Codex 在工作目录内使用 `workspace-write` 沙箱，额外权限请求会被拒绝。吸附后会读取目标窗口的路径和一份有限的内容：文件管理器提供当前目录和文件名，代码编辑器提供当前文件路径和开头文本，终端提供命令提示符里的目录和前台命令。浏览器通常只能提供窗口标题；地址只有在辅助功能接口暴露时才会附上。这些上下文会随消息发给 Codex，识别到的目录会作为本次会话的工作目录。密钥样式的文件名不会被读入提示。当前版本需要 X11，会在 GNOME 登录后启动，不是系统开机后、登录前运行的后台服务。
+Codex 通过本机 `codex app-server` 运行，使用当前 Codex CLI 登录状态。每个工作目录会建立独立会话。Codex 在工作目录内使用 `workspace-write` 沙箱，额外权限请求会被拒绝。吸附后会读取目标窗口的路径和一份有限的内容：文件管理器提供当前目录和文件名，代码编辑器提供当前文件路径和开头文本，终端提供命令提示符里的目录和前台命令。浏览器通常只能提供窗口标题；地址只有在辅助功能接口暴露时才会附上。这些上下文会随消息发给 Codex，识别到的目录会作为本次会话的工作目录。密钥样式的文件名不会被读入提示。Linux 版需要 X11，会在 GNOME 登录后启动。Windows 版在登录后的桌面会话中运行。两边都不是系统开机后、登录前运行的后台服务。
 
 ## 浏览器设计原型
 

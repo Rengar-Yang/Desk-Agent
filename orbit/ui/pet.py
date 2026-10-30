@@ -18,16 +18,17 @@ from PyQt5.QtWidgets import QApplication, QDialog, QMenu, QMessageBox, QWidget
 
 from orbit.agent.codex import CodexBridge
 from orbit.agent.tools import API_TOOLS, api_error_text, kill_running_shell, run_tool, tool_label
-from orbit.config import ROOT, get_config, load_api_token, load_user_settings, save_user_settings
+from orbit.config import get_config, load_api_token, load_user_settings, save_user_settings
 from orbit.desktop.context import capture_context, context_prompt
-from orbit.desktop.x11 import hydrate_window, topmost_at
+from orbit.desktop.common import hydrate_window, topmost_at
 from orbit.theme import ACCENTS, KIND_LABELS
 from orbit.ui.chat import ChatWindow
 from orbit.ui.confirm import confirm_action
 from orbit.ui.notch import HomeNotch
 from orbit.ui.overlay import TargetOverlay
 from orbit.ui.probe import WindowProbe
-from orbit.ui.settings import SettingsDialog, autostart_file
+from orbit.desktop.autostart import set_login_autostart
+from orbit.ui.settings import SettingsDialog
 from orbit.ui.tether import TetherWindow
 
 
@@ -241,8 +242,15 @@ class Pet(QWidget):
         self.setMask(region)
 
     def request_windows(self):
+        self.refresh_screen_map()
         own_ids = {int(widget.winId()) for widget in QApplication.topLevelWidgets()}
         self.probe.request(own_ids)
+
+    def refresh_screen_map(self):
+        if os.name != "nt":
+            return
+        from orbit.desktop.win32 import note_qt_screens
+        note_qt_screens()
 
     def on_windows(self, seq, windows):
         if seq != self.probe.seq:
@@ -702,6 +710,7 @@ class Pet(QWidget):
         self.update()
 
     def follow_target(self):
+        self.refresh_screen_map()
         self.probe.set_own_ids(self.own_window_ids())
         if not self.target or self.drag_start:
             return
@@ -982,13 +991,6 @@ class Pet(QWidget):
         self.set_autostart(dialog.autostart.isChecked())
 
     def set_autostart(self, enabled):
-        target = autostart_file()
-        if enabled:
-            desktop = ROOT / "orbit-codex.desktop"
-            if not desktop.exists():
-                QMessageBox.information(self, "Orbit", "请先运行 install.sh 安装启动项。")
-                return
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(desktop.read_text())
-        else:
-            target.unlink(missing_ok=True)
+        error = set_login_autostart(enabled)
+        if error:
+            QMessageBox.information(self, "Orbit", error)

@@ -1,4 +1,4 @@
-"""The settings dialog and the login autostart desktop file."""
+"""The settings dialog. Login autostart is applied when the dialog is saved."""
 
 from pathlib import Path
 
@@ -6,7 +6,7 @@ from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
 )
 
-from orbit.config import CONFIG_DIR
+from orbit.desktop.autostart import login_autostart_enabled
 
 
 class SettingsDialog(QDialog):
@@ -45,7 +45,7 @@ class SettingsDialog(QDialog):
         self.hints.setChecked(settings.get("hints", True))
         form.addRow(self.hints)
         self.autostart = QCheckBox("登录桌面后自动启动")
-        self.autostart.setChecked(autostart_file().exists())
+        self.autostart.setChecked(login_autostart_enabled())
         form.addRow(self.autostart)
         note = QLabel("吸附后会把该目录交给当前回复来源。自定义 API 可以读取、搜索、修改文件、运行命令和抓取网页；写入与命令会先确认。Codex 在该目录内可写，并可以访问网络，越权操作也会先确认。")
         note.setWordWrap(True)
@@ -64,6 +64,3 @@ class SettingsDialog(QDialog):
         path = QFileDialog.getExistingDirectory(self, "选择工作目录", self.cwd.text())
         if path:
             self.cwd.setText(path)
-
-def autostart_file():
-    return CONFIG_DIR.parent / "autostart" / "orbit-codex.desktop"
