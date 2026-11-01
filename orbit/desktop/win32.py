@@ -7,7 +7,7 @@ import threading
 from ctypes import wintypes
 from urllib.parse import unquote, urlparse
 
-from orbit.desktop.common import classify_window, window_covers
+from orbit.desktop.common import classify_window, is_overlay_process, window_covers
 
 _WINFUNCTYPE = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)
 if not hasattr(ctypes, "HRESULT"):
@@ -18,6 +18,23 @@ SKIP_CLASSES = {
     "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland",
     "XamlExplorerHostIslandWindow",
 }
+# Recording / capture surfaces that often sit fullscreen above Explorer.
+CAPTURE_EXACT = {
+    "obs64.exe", "obs32.exe", "obs.exe",
+    "bdcam.exe", "bandicam.exe",
+    "fraps.exe",
+    "medal.exe", "medalencoder.exe",
+    "streamlabs obs.exe", "streamlabs obs64.exe",
+    "xsplit.core.exe", "xsplit.gamecaster.exe",
+    "action.exe",  # Mirillis Action
+    "nvidia share.exe", "nvidia overlay.exe",
+}
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x00000008
+WS_EX_TRANSPARENT = 0x00000020
+WS_EX_TOOLWINDOW = 0x00000080
+WS_EX_LAYERED = 0x00080000
+WS_EX_NOACTIVATE = 0x08000000
 CLASS_KIND = {
     "CabinetWClass": "files",
     "ExploreWClass": "files",
@@ -174,6 +191,10 @@ def user32():
         _user32.EnumDisplayMonitors.restype = wintypes.BOOL
         _user32.GetMonitorInfoW.argtypes = [wintypes.HMONITOR, ctypes.POINTER(MONITORINFOEXW)]
         _user32.GetMonitorInfoW.restype = wintypes.BOOL
+        long_ptr = getattr(_user32, "GetWindowLongPtrW", None) or _user32.GetWindowLongW
+        long_ptr.argtypes = [wintypes.HWND, ctypes.c_int]
+        long_ptr.restype = ctypes.c_size_t
+        _user32._orbit_get_long = long_ptr
     return _user32
 
 
@@ -677,6 +698,78 @@ def _own_process(pid, image):
     return os.path.basename(image or "").lower() == "orbit.exe"
 
 
+def _exstyle(hwnd):
+    try:
+        return int(user32()._orbit_get_long(hwnd, GWL_EXSTYLE))
+    except Exception:
+        return 0
+
+
+def _monitor_rects_logical():
+    screens = _screens
+    if screens:
+        return [screen["logical"] for screen in screens if screen.get("logical")]
+    found = []
+    for _name, physical in _physical_monitors().items():
+        found.append(to_logical(*physical))
+    if found:
+        return found
+    try:
+        width = ctypes.windll.user32.GetSystemMetrics(0)
+        height = ctypes.windll.user32.GetSystemMetrics(1)
+        if width > 0 and height > 0:
+            return [(0, 0, width, height)]
+    except Exception:
+        pass
+    return []
+
+
+def _max_monitor_coverage(box):
+    x, y, width, height = box
+    if width <= 0 or height <= 0:
+        return 0.0
+    best = 0.0
+    for mx, my, mw, mh in _monitor_rects_logical():
+        if mw <= 0 or mh <= 0:
+            continue
+        left, top = max(x, mx), max(y, my)
+        right, bottom = min(x + width, mx + mw), min(y + height, my + mh)
+        inter = max(0, right - left) * max(0, bottom - top)
+        best = max(best, inter / float(mw * mh))
+    return best
+
+
+def _is_ignored_layer(hwnd, image="", title="", box=None):
+    """Skip GPU overlays, click-through HUDs, and fullscreen capture surfaces."""
+    if is_overlay_process(image):
+        return True
+    style = _exstyle(hwnd)
+    if style & WS_EX_TRANSPARENT:
+        return True
+    if box is None:
+        return False
+    coverage = _max_monitor_coverage(box)
+    overlayish = bool(style & (WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE))
+    layered = bool(style & WS_EX_LAYERED)
+    base = os.path.basename(image or "").lower()
+    if coverage >= 0.9 and (overlayish or (layered and not (title or "").strip())):
+        return True
+    if coverage >= 0.9 and base in CAPTURE_EXACT and (overlayish or layered):
+        return True
+    if (style & WS_EX_TOOLWINDOW) and not (title or "").strip() and coverage >= 0.5:
+        return True
+    lowered = (title or "").lower()
+    if coverage >= 0.85 and any(
+        token in lowered
+        for token in (
+            "nvidia overlay", "nvidia geforce", "geforce overlay", "geforce experience",
+            "xbox game bar", "game bar", "fullscreen projector", "windowed projector",
+        )
+    ):
+        return True
+    return False
+
+
 def _stacking():
     found = []
 
@@ -706,10 +799,14 @@ def _describe(hwnd, own_ids, folders):
     if title.startswith("@!"):
         return None
     kind = kind_for(image, class_name, title)
+    if kind == "overlay":
+        return None
     if not title and class_name not in CLASS_KIND:
         return None
     box = _window_box(hwnd)
     if box is None:
+        return None
+    if _is_ignored_layer(hwnd, image, title, box):
         return None
     cwd, _command = _process_strings(pid)
     folder = folders.get(number & 0xFFFFFFFF)
@@ -782,7 +879,11 @@ def window_is_covered(wid, rect, own_ids, cache):
         cached = cache.get(other)
         if cached is None or now - cached[0] > 0.5:
             try:
-                found = None if _cloaked(other) or user32().IsIconic(other) or not user32().IsWindowVisible(other) else _window_box(other)
+                found = None
+                if not (_cloaked(other) or user32().IsIconic(other) or not user32().IsWindowVisible(other)):
+                    box = _window_box(other)
+                    if box and not _is_ignored_layer(other, _image_path(_pid(other)), _text(other), box):
+                        found = box
             except Exception:
                 found = None
             cached = (now, found)

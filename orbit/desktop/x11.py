@@ -6,12 +6,18 @@ import subprocess
 import time
 from pathlib import Path
 
-from orbit.desktop.common import classify_window, window_covers
+from orbit.desktop.common import classify_window, is_overlay_process, window_covers
 
 SKIPPED_WINDOW_TYPES = (
     "_NET_WM_WINDOW_TYPE_DESKTOP",
     "_NET_WM_WINDOW_TYPE_DOCK",
     "_NET_WM_WINDOW_TYPE_SPLASH",
+    "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+    "_NET_WM_WINDOW_TYPE_TOOLTIP",
+    "_NET_WM_WINDOW_TYPE_DROPDOWN_MENU",
+    "_NET_WM_WINDOW_TYPE_POPUP_MENU",
+    "_NET_WM_WINDOW_TYPE_COMBO",
+    "_NET_WM_WINDOW_TYPE_DND",
 )
 
 
@@ -47,11 +53,14 @@ def query_windows(own_ids, only_id=None):
         if pid == os.getpid():
             continue
         command = b""
+        arguments = []
         if pid:
             try:
                 command = (Path("/proc") / str(pid) / "cmdline").read_bytes()
                 arguments = [os.fsdecode(arg) for arg in command.split(b"\0") if arg]
                 if any(Path(arg).name in ("native_app.py", "orbit-codex") or arg.replace("\\", "/").endswith("/orbit/__main__.py") for arg in arguments):
+                    continue
+                if any(is_overlay_process(arg) or is_overlay_process(Path(arg).name) for arg in arguments):
                     continue
             except OSError:
                 pass
@@ -73,6 +82,11 @@ def query_windows(own_ids, only_id=None):
         if title.startswith("@!"):
             continue
         app_class = class_match.group(1).replace('"', "") if class_match else "应用"
+        if is_overlay_process(app_class) or classify_window(app_class) == "overlay":
+            continue
+        lowered_title = (title or "").lower()
+        if any(token in lowered_title for token in ("geforce", "nvidia overlay", "game bar")):
+            continue
         cwd = None
         if pid:
             try:
@@ -148,7 +162,8 @@ def layer_rect(wid, own_ids, current_desktop):
     if int(wid, 16) in own_ids:
         return None
     props = run_x(
-        "xprop", "-id", wid, "_NET_WM_PID", "_NET_WM_WINDOW_TYPE", "_NET_WM_STATE",
+        "xprop", "-id", wid, "_NET_WM_PID", "WM_CLASS", "_NET_WM_NAME", "WM_NAME",
+        "_NET_WM_WINDOW_TYPE", "_NET_WM_STATE",
         "_NET_WM_DESKTOP", "_NET_FRAME_EXTENTS", "_GTK_FRAME_EXTENTS",
     )
     if any(kind in props for kind in SKIPPED_WINDOW_TYPES):
@@ -159,7 +174,29 @@ def layer_rect(wid, own_ids, current_desktop):
     if current_desktop is not None and window_desktop not in (None, current_desktop, 0xFFFFFFFF):
         return None
     pid_match = re.search(r"_NET_WM_PID\(CARDINAL\) = (\d+)", props)
-    if pid_match and int(pid_match.group(1)) == os.getpid():
+    if pid_match:
+        pid = int(pid_match.group(1))
+        if pid == os.getpid():
+            return None
+        try:
+            arguments = [
+                os.fsdecode(arg)
+                for arg in (Path("/proc") / str(pid) / "cmdline").read_bytes().split(b"\0")
+                if arg
+            ]
+            if any(is_overlay_process(arg) or is_overlay_process(Path(arg).name) for arg in arguments):
+                return None
+        except OSError:
+            pass
+    class_match = re.search(r'WM_CLASS\([^\n]*? = (.+)', props)
+    app_class = class_match.group(1).replace('"', "") if class_match else ""
+    if is_overlay_process(app_class) or classify_window(app_class) == "overlay":
+        return None
+    title_match = re.search(r'_NET_WM_NAME\([^\n]*? = "((?:\\.|[^"\\\n])*)"', props)
+    if not title_match:
+        title_match = re.search(r'WM_NAME\([^\n]*? = "((?:\\.|[^"\\\n])*)"', props)
+    title = unescape_xprop(title_match.group(1)) if title_match else ""
+    if any(token in title.lower() for token in ("geforce", "nvidia overlay", "game bar")):
         return None
     geo = run_x("xwininfo", "-id", wid)
     if "Map State: IsViewable" not in geo:
