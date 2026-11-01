@@ -5,7 +5,7 @@ import time
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from orbit.desktop.session import query_window_rect, query_windows, window_is_covered
+from orbit.desktop.session import query_window_presence, query_windows, window_is_covered
 
 
 class WindowProbe(QObject):
@@ -56,7 +56,6 @@ class WindowProbe(QObject):
     def _watch_loop(self):
         last = None
         seen = None
-        miss_sent = False
         covered = False
         checked = 0.
         cache = {}
@@ -76,18 +75,15 @@ class WindowProbe(QObject):
                 covered = False
                 checked = 0.
                 cache = {}
-                miss_sent = False
             try:
-                rect = query_window_rect(wid)
+                presence, rect = query_window_presence(wid)
             except Exception:
-                rect = None
-            if rect is None:
-                if not miss_sent:
-                    miss_sent = True
-                    last = None
-                    self.placed.emit(wid, None)
+                presence, rect = "gone", None
+            if presence == "gone":
+                state = None
+            elif presence == "hidden":
+                state = ("hidden",)
             else:
-                miss_sent = False
                 now = time.monotonic()
                 if now - checked > 0.2:
                     checked = now
@@ -96,9 +92,9 @@ class WindowProbe(QObject):
                     except Exception:
                         covered = False
                 state = (rect, covered)
-                if state != last:
-                    last = state
-                    self.placed.emit(wid, state)
+            if state != last:
+                last = state
+                self.placed.emit(wid, state)
             time.sleep(0.04)
 
     def _work(self, seq, own_ids):

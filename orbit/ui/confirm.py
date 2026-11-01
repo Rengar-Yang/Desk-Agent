@@ -69,7 +69,7 @@ def _block(text, lines=4):
 class ApprovalDialog(QDialog):
     """A card that shows exactly what will run or change, and refuses by default."""
 
-    def __init__(self, title, detail, parent=None):
+    def __init__(self, title, detail, parent=None, allow_task=True):
         super().__init__(parent, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setFont(ui_font(13, subpixel=False))
         self.setAttribute(Qt.WA_TranslucentBackground)
@@ -102,8 +102,14 @@ class ApprovalDialog(QDialog):
         heading.setObjectName("approvalTitle")
         heading.setWordWrap(True)
         layout.addWidget(heading)
-        hint = QLabel("拒绝后这次操作不会执行。")
+        self.decision = "deny"
+        if allow_task and kind in ("file", "command"):
+            hint_text = "拒绝后这次操作不会执行。选「本次允许」后，同一目录里接下来的同类操作不再逐条询问，直到结束任务或清空对话。"
+        else:
+            hint_text = "拒绝后这次操作不会执行。"
+        hint = QLabel(hint_text)
         hint.setObjectName("approvalHint")
+        hint.setWordWrap(True)
         layout.addWidget(hint)
         self._add_body(layout, _parse_detail(detail))
 
@@ -111,17 +117,23 @@ class ApprovalDialog(QDialog):
         buttons.setSpacing(8)
         deny = QPushButton("拒绝")
         deny.setObjectName("denyButton")
-        allow = QPushButton("允许")
+        allow = QPushButton("仅此一次")
         allow.setObjectName("allowButton")
-        deny.clicked.connect(self.reject)
-        allow.clicked.connect(self.accept)
+        deny.clicked.connect(lambda: self._choose("deny"))
+        allow.clicked.connect(lambda: self._choose("once"))
         deny.setAutoDefault(False)
         allow.setAutoDefault(False)
         allow.setDefault(False)
         buttons.addWidget(deny, 1)
+        if allow_task and kind in ("file", "command"):
+            task = QPushButton("本次允许")
+            task.setObjectName("taskButton")
+            task.clicked.connect(lambda: self._choose("task"))
+            task.setAutoDefault(False)
+            buttons.addWidget(task, 1)
         buttons.addWidget(allow, 1)
         layout.addLayout(buttons)
-        keys = QLabel("Esc 拒绝    Ctrl+Enter 允许")
+        keys = QLabel("Esc 拒绝    Ctrl+Enter 仅此一次")
         keys.setObjectName("approvalKeys")
         keys.setAlignment(Qt.AlignRight)
         layout.addWidget(keys)
@@ -144,8 +156,10 @@ class ApprovalDialog(QDialog):
             #denyButton:hover {{ background: #e4def2; }}
             #allowButton {{ background: {accent}; color: white; font-weight: 700; }}
             #allowButton:hover {{ background: {accent}; }}
+            #taskButton {{ background: #efeaf8; color: {accent}; font-weight: 700; }}
+            #taskButton:hover {{ background: #e4def4; }}
         """)
-        self.setFixedWidth(456)
+        self.setFixedWidth(520)
         self._deny = deny
 
     def _add_body(self, layout, fields):
@@ -210,21 +224,30 @@ class ApprovalDialog(QDialog):
         y = max(area.top() + 12, min(anchor.y() - self.height() // 2, area.bottom() - self.height() - 12))
         self.move(x, y)
 
+    def _choose(self, decision):
+        self.decision = decision
+        if decision == "deny":
+            self.reject()
+        else:
+            self.accept()
+
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape:
-            self.reject()
+            self._choose("deny")
             return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter) and event.modifiers() & Qt.ControlModifier:
-            self.accept()
+            self._choose("once")
             return
         if event.key() in (Qt.Key_Return, Qt.Key_Enter):
             return
         super().keyPressEvent(event)
 
 
-def confirm_action(title, detail, parent=None):
-    dialog = ApprovalDialog(title, detail, parent)
-    return dialog.exec_() == QDialog.Accepted
+def confirm_action(title, detail, parent=None, allow_task=True):
+    """Return deny, once, or task. Closing the card counts as deny."""
+    dialog = ApprovalDialog(title, detail, parent, allow_task=allow_task)
+    dialog.exec_()
+    return dialog.decision
 
 
 def approval_summary(params):

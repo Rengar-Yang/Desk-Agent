@@ -68,7 +68,7 @@ selected_preview_chars = 4000
 directory_limit = 60
 
 [tools]
-shell_timeout = 30
+shell_timeout = 120
 fetch_timeout = 20
 list_limit = 200
 

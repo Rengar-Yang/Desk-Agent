@@ -305,6 +305,20 @@ def capture_context(window):
             path = Path(cwd)
             entries = list_directory(path, get_config().context.directory_limit)
     summary = " · ".join(part for part in (str(path) if path else "", detail) if part)
+    if kind == "files" and path:
+        detail_level = "directory"
+    elif kind == "editor" and path and preview:
+        detail_level = "file"
+    elif kind == "editor" and path:
+        detail_level = "file_meta"
+    elif kind == "terminal" and path:
+        detail_level = "cwd"
+    elif kind == "browser" and snapshot.get("url"):
+        detail_level = "url"
+    elif path:
+        detail_level = "cwd"
+    else:
+        detail_level = "title"
     return {
         "kind": kind,
         "accent": ACCENTS[kind],
@@ -313,6 +327,7 @@ def capture_context(window):
         "preview": preview,
         "summary": summary or KIND_LABELS[kind],
         "url": snapshot.get("url"),
+        "detail_level": detail_level,
     }
 
 

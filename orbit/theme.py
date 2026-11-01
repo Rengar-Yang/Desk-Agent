@@ -61,3 +61,33 @@ def _prompts():
 
 ACCENTS = _accents()
 CONTEXT_PROMPTS = _prompts()
+
+_LEVEL_HEADLINE = {
+    "directory": "已读取文件夹",
+    "file": "已读取文件开头",
+    "file_meta": "只定位到文件，没有正文",
+    "cwd": "已读取所在目录",
+    "url": "只读到页面地址，没有正文",
+    "title": "只看到窗口标题",
+}
+
+
+def context_headline(level):
+    return _LEVEL_HEADLINE.get(level or "title", "已连接窗口")
+
+
+def suggestion_prompts(target):
+    """Chips must match what was actually captured."""
+    if not target:
+        return list(CONTEXT_PROMPTS[None])
+    kind = target.get("kind", "other")
+    level = target.get("detail_level") or "title"
+    if kind == "browser" and level != "url":
+        return ["根据标题说说这可能是什么", "把链接发我后帮我总结", "我下一步该看什么？"]
+    if kind == "editor" and level == "title":
+        return ["这个窗口是做什么的？", "我把文件路径发给你", "给我下一步建议"]
+    if level == "title":
+        return ["这个窗口是做什么的？", "你现在能读到什么？", "给我下一步建议"]
+    if kind == "browser" and level == "url":
+        return ["抓取并总结这个地址", "提炼三个要点", "我下一步该看什么？"]
+    return list(CONTEXT_PROMPTS.get(kind, CONTEXT_PROMPTS["other"]))

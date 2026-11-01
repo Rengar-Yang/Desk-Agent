@@ -11,6 +11,7 @@ from PyQt5.QtWidgets import QWidget
 
 from orbit.config import get_config
 from orbit.desktop.context import context_prompt
+from orbit.agent.safety import approval_paths
 from orbit.ui.confirm import approval_summary, confirm_action
 
 
@@ -61,6 +62,9 @@ class CodexBridge(QWidget):
         self.answer_generation = 0
         self.silent_exit = False
         self.quitting = False
+        self.grants = None
+        self.undo = None
+        self.memory_provider = None
         self.watchdog = QTimer(self)
         self.watchdog.setSingleShot(True)
         self.watchdog.timeout.connect(self.timed_out)
@@ -151,7 +155,7 @@ class CodexBridge(QWidget):
         text, cwd, context = self.pending
         if self.thread_id and self.thread_cwd == cwd:
             self.pending = None
-            self.start_turn(text, cwd, context)
+            self.start_turn(text, cwd, context, fresh=False)
             return
         self.thread_id = None
         self.thread_cwd = cwd
@@ -171,10 +175,14 @@ class CodexBridge(QWidget):
         if self.pending:
             text, cwd, context = self.pending
             self.pending = None
-            self.start_turn(text, cwd, context)
+            self.start_turn(text, cwd, context, fresh=True)
 
-    def start_turn(self, text, cwd, context):
+    def start_turn(self, text, cwd, context, fresh=False):
         prefix = context_prompt(context, cwd)
+        if fresh and self.memory_provider:
+            recap = self.memory_provider() or ""
+            if recap.strip():
+                prefix += "以下是这次保留下来的对话，请接着做，不要重复询问已经说过的内容。\n" + recap.strip() + "\n\n"
         if prefix:
             text = prefix + "用户请求：" + text
         self.answer = ""
@@ -265,6 +273,40 @@ class CodexBridge(QWidget):
                 detail = (turn.get("error") or {}).get("message", "Codex 执行失败")
                 self.error.emit(detail)
 
+    def _granted(self, kind):
+        grants = self.grants
+        root = self.thread_cwd
+        if not grants or not root:
+            return False
+        if kind == "file":
+            return grants.files_ok(root)
+        if kind == "shell":
+            return grants.shell_ok(root)
+        return False
+
+    def _remember_paths(self, params):
+        if not self.undo:
+            return
+        for raw in approval_paths(params):
+            self.undo.remember(raw)
+
+    def _decide(self, kind, title, detail, params):
+        if self._granted(kind):
+            if kind == "file":
+                self._remember_paths(params)
+            return "once"
+        decision = confirm_action(title, detail, self, allow_task=kind in ("file", "shell"))
+        if decision == "deny":
+            return "deny"
+        if kind == "file":
+            self._remember_paths(params)
+        if decision == "task" and self.grants and self.thread_cwd:
+            if kind == "file":
+                self.grants.allow_files(self.thread_cwd)
+            elif kind == "shell":
+                self.grants.allow_shell(self.thread_cwd)
+        return decision
+
     def reply_to_server(self, message):
         method = message.get("method", "")
         params = message.get("params") or {}
@@ -272,7 +314,8 @@ class CodexBridge(QWidget):
             result = {"currentTimeAt": int(time.time())}
         elif method == "item/permissions/requestApproval":
             detail = approval_summary(params)
-            if confirm_action("Codex 请求额外权限", detail, self):
+            decision = confirm_action("Codex 请求额外权限", detail, self, allow_task=False)
+            if decision != "deny":
                 result = {"permissions": params.get("permissions") or {}, "scope": "turn"}
                 self.status.emit("已允许 Codex 的权限请求")
             else:
@@ -281,15 +324,17 @@ class CodexBridge(QWidget):
                 self.status.emit("已拒绝 Codex 的权限请求")
                 return
         elif method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-            title = "Codex 请求执行命令" if "command" in method else "Codex 请求修改文件"
-            accepted = confirm_action(title, approval_summary(params), self)
-            result = {"decision": "accept" if accepted else "decline"}
-            self.status.emit("已允许 Codex 操作" if accepted else "已拒绝 Codex 操作")
+            kind = "shell" if "command" in method else "file"
+            title = "Codex 请求执行命令" if kind == "shell" else "Codex 请求修改文件"
+            decision = self._decide(kind, title, approval_summary(params), params)
+            result = {"decision": "accept" if decision != "deny" else "decline"}
+            self.status.emit("已允许 Codex 操作" if decision != "deny" else "已拒绝 Codex 操作")
         elif method in ("execCommandApproval", "applyPatchApproval"):
-            title = "Codex 请求执行命令" if method == "execCommandApproval" else "Codex 请求修改文件"
-            accepted = confirm_action(title, approval_summary(params), self)
-            result = {"decision": "approved" if accepted else "abort"}
-            self.status.emit("已允许 Codex 操作" if accepted else "已拒绝 Codex 操作")
+            kind = "shell" if method == "execCommandApproval" else "file"
+            title = "Codex 请求执行命令" if kind == "shell" else "Codex 请求修改文件"
+            decision = self._decide(kind, title, approval_summary(params), params)
+            result = {"decision": "approved" if decision != "deny" else "abort"}
+            self.status.emit("已允许 Codex 操作" if decision != "deny" else "已拒绝 Codex 操作")
         else:
             payload = {"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32000, "message": "Orbit declined this request"}}
             self.process.write((json.dumps(payload) + "\n").encode())

@@ -152,7 +152,7 @@ class ContextConfig:
 
 class ToolsConfig:
     def __init__(self, data):
-        self.shell_timeout = _int(data, "shell_timeout", 30, 1, 300)
+        self.shell_timeout = _int(data, "shell_timeout", 120, 1, 300)
         self.fetch_timeout = _int(data, "fetch_timeout", 20, 1, 120)
         self.list_limit = _int(data, "list_limit", 200, 1, 1000)
 
@@ -253,6 +253,41 @@ def load_user_settings():
     if settings.get("provider") not in ("codex", "api"):
         settings["provider"] = default_user_settings()["provider"]
     return settings
+
+
+def setting_int(settings, key, default, low, high):
+    try:
+        value = int(settings.get(key))
+    except (TypeError, ValueError):
+        return default
+    return min(high, max(low, value))
+
+
+def setting_float(settings, key, default, low, high):
+    try:
+        value = float(settings.get(key))
+    except (TypeError, ValueError):
+        return default
+    return min(high, max(low, value))
+
+
+def mascot_scale(settings):
+    if settings.get("scale") in (None, ""):
+        return get_config().mascot.scale
+    return setting_float(settings, "scale", get_config().mascot.scale, 0.35, 3.0)
+
+
+def follow_interval(settings):
+    if settings.get("follow_ms") in (None, ""):
+        return get_config().behavior.follow_ms
+    return setting_int(settings, "follow_ms", get_config().behavior.follow_ms, 40, 2000)
+
+
+def shell_timeout_seconds(settings=None):
+    settings = load_user_settings() if settings is None else settings
+    if settings.get("shell_timeout") in (None, ""):
+        return get_config().tools.shell_timeout
+    return setting_int(settings, "shell_timeout", get_config().tools.shell_timeout, 5, 300)
 
 
 def save_user_settings(settings):

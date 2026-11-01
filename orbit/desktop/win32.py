@@ -195,6 +195,12 @@ def user32():
         long_ptr.argtypes = [wintypes.HWND, ctypes.c_int]
         long_ptr.restype = ctypes.c_size_t
         _user32._orbit_get_long = long_ptr
+        _user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+        _user32.GetWindow.restype = wintypes.HWND
+        _user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        ]
+        _user32.SetWindowPos.restype = wintypes.BOOL
     return _user32
 
 
@@ -851,15 +857,26 @@ def query_windows(own_ids, only_id=None):
     return result
 
 
-def query_window_rect(wid):
-    """Visible rect of one window, or None when it is gone, minimized, or hidden."""
+def query_window_presence(wid):
+    """Return ('gone', None), ('hidden', None), or ('visible', rect)."""
     try:
         hwnd = int(str(wid), 16)
     except ValueError:
-        return None
-    if not user32().IsWindow(hwnd) or not user32().IsWindowVisible(hwnd) or user32().IsIconic(hwnd) or _cloaked(hwnd):
-        return None
-    return _window_box(hwnd)
+        return "gone", None
+    if not user32().IsWindow(hwnd):
+        return "gone", None
+    if not user32().IsWindowVisible(hwnd) or user32().IsIconic(hwnd) or _cloaked(hwnd):
+        return "hidden", None
+    box = _window_box(hwnd)
+    if box is None:
+        return "hidden", None
+    return "visible", box
+
+
+def query_window_rect(wid):
+    """Visible rect of one window, or None when it is gone, minimized, or hidden."""
+    state, rect = query_window_presence(wid)
+    return rect if state == "visible" else None
 
 
 def window_is_covered(wid, rect, own_ids, cache):
@@ -915,3 +932,138 @@ def windows_process_table():
     finally:
         kernel32().CloseHandle(snapshot)
     return table, children
+
+
+_SWP_LAYER = 0x0001 | 0x0002 | 0x0010  # NOSIZE | NOMOVE | NOACTIVATE
+_HWND_TOPMOST = -1
+_HWND_NOTOPMOST = -2
+_GW_HWNDPREV = 3
+
+
+def _as_hwnd(value):
+    return wintypes.HWND(int(value))
+
+
+def _is_topmost(hwnd):
+    style = user32()._orbit_get_long(_as_hwnd(hwnd), GWL_EXSTYLE)
+    return bool(int(style) & WS_EX_TOPMOST)
+
+
+def _set_z(hwnd, after):
+    user32().SetWindowPos(_as_hwnd(hwnd), _as_hwnd(after), 0, 0, 0, 0, _SWP_LAYER)
+
+
+def _window_above(hwnd, skip):
+    current = user32().GetWindow(_as_hwnd(hwnd), _GW_HWNDPREV)
+    seen = set()
+    while current:
+        number = int(current)
+        if not number or number in seen:
+            return 0
+        seen.add(number)
+        if number not in skip:
+            return number
+        current = user32().GetWindow(current, _GW_HWNDPREV)
+    return 0
+
+
+def _stacked_above(owner, group):
+    """True when group already sits directly on owner, lowest hwnd first."""
+    current = owner
+    owner_top = _is_topmost(owner)
+    for hwnd in group:
+        current = _window_above(current, set())
+        if current != hwnd or _is_topmost(hwnd) != owner_top:
+            return False
+    return True
+
+
+def stack_with_window(owner, followers):
+    """Keep followers immediately above owner, below any window that covers owner.
+
+    followers is bottom-to-top: the first handle sits closest to the owner.
+    """
+    try:
+        owner = int(owner)
+    except (TypeError, ValueError):
+        return
+    if not owner or not user32().IsWindow(_as_hwnd(owner)):
+        return
+    group = []
+    for hwnd in followers:
+        try:
+            number = int(hwnd)
+        except (TypeError, ValueError):
+            continue
+        if number and number != owner and user32().IsWindow(_as_hwnd(number)):
+            group.append(number)
+    if not group:
+        return
+    owner_top = _is_topmost(owner)
+    for hwnd in group:
+        if _is_topmost(hwnd) != owner_top:
+            _set_z(hwnd, _HWND_TOPMOST if owner_top else _HWND_NOTOPMOST)
+    if _stacked_above(owner, group):
+        return
+    anchor = _window_above(owner, set(group)) or 0
+    for hwnd in reversed(group):
+        _set_z(hwnd, anchor)
+        anchor = hwnd
+
+
+def float_above(hwnds):
+    """Put these windows on the topmost band. The last handle ends up highest."""
+    ordered = []
+    for hwnd in hwnds:
+        try:
+            number = int(hwnd)
+        except (TypeError, ValueError):
+            continue
+        if number and user32().IsWindow(_as_hwnd(number)):
+            ordered.append(number)
+    for hwnd in ordered:
+        _set_z(hwnd, _HWND_TOPMOST)
+
+
+def focus_window(hwnd):
+    """Raise a normal window above other apps. The caller then stacks Orbit just above it."""
+    handle = wintypes.HWND(int(hwnd))
+    if not user32().IsWindow(handle):
+        return
+    user32().ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+    user32().ShowWindow.restype = wintypes.BOOL
+    if user32().IsIconic(handle):
+        user32().ShowWindow(handle, 9)
+    user32().ShowWindow(handle, 5)
+    user32().SetWindowPos.argtypes = [
+        wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT,
+    ]
+    user32().SetWindowPos.restype = wintypes.BOOL
+    user32().SetWindowPos(handle, wintypes.HWND(0), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0040)
+    user32().BringWindowToTop.argtypes = [wintypes.HWND]
+    user32().BringWindowToTop.restype = wintypes.BOOL
+    user32().SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32().SetForegroundWindow.restype = wintypes.BOOL
+    user32().AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+    user32().AttachThreadInput.restype = wintypes.BOOL
+    kernel32().GetCurrentThreadId.argtypes = []
+    kernel32().GetCurrentThreadId.restype = wintypes.DWORD
+    current = kernel32().GetCurrentThreadId()
+    user32().GetForegroundWindow.argtypes = []
+    user32().GetForegroundWindow.restype = wintypes.HWND
+    foreground = user32().GetForegroundWindow()
+    fore_thread = user32().GetWindowThreadProcessId(foreground, None) if foreground else 0
+    target_thread = user32().GetWindowThreadProcessId(handle, None)
+    attached_fore = attached_target = False
+    if fore_thread and fore_thread != current:
+        attached_fore = bool(user32().AttachThreadInput(current, fore_thread, True))
+    if target_thread and target_thread not in (0, current):
+        attached_target = bool(user32().AttachThreadInput(current, target_thread, True))
+    try:
+        user32().BringWindowToTop(handle)
+        user32().SetForegroundWindow(handle)
+    finally:
+        if attached_target:
+            user32().AttachThreadInput(current, target_thread, False)
+        if attached_fore:
+            user32().AttachThreadInput(current, fore_thread, False)

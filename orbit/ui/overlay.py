@@ -83,8 +83,8 @@ class TargetOverlay(QWidget):
                     p.setPen(Qt.NoPen)
                     p.setBrush(band)
                     p.drawRoundedRect(int(inner.left() + (inner.width() + 40) * sweep - 50), inner.top(), 42, 28, 8, 8)
-        if self.show_hint or self.connected:
-            text = ("✦  ORBIT 已连接" if self.connected else f"✦  松开以连接 · {self.target['title'][:30]}")
+        if self.show_hint and not self.connected:
+            text = f"✦  松开以连接 · {self.target['title'][:30]}"
             metrics = p.fontMetrics()
             width = min(inner.width() - 20, metrics.horizontalAdvance(text) + 28)
             p.setPen(Qt.NoPen)

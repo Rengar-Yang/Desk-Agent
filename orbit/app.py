@@ -62,6 +62,9 @@ def main():
     instance_lock = QLockFile(lock_path())
     app._instance_lock = instance_lock
     if not instance_lock.tryLock(0):
+        if os.environ.get("ORBIT_WATCHER"):
+            print("Orbit 已在运行，不再启动第二个。", flush=True)
+            return 0
         QMessageBox.information(None, "Orbit", "Orbit 已在运行。请先退出旧进程，再启动更新后的版本。")
         return 0
     app.setQuitOnLastWindowClosed(False)

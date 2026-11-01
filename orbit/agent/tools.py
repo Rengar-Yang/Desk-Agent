@@ -11,7 +11,7 @@ import urllib.request
 from pathlib import Path
 from urllib.parse import urlparse
 
-from orbit.config import get_config
+from orbit.config import get_config, shell_timeout_seconds
 from orbit.desktop.files import (
     SKIP_DIRS, clip_text, list_directory, looks_secret, read_file_text, scoped_path, search_files,
 )
@@ -143,14 +143,15 @@ def run_shell_command(command, root):
     with _shell_lock:
         _shell_pgid = process.pid
     try:
-        stdout, stderr = process.communicate(timeout=get_config().tools.shell_timeout)
+        timeout = shell_timeout_seconds()
+        stdout, stderr = process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         kill_running_shell()
         try:
             process.communicate(timeout=2)
         except subprocess.TimeoutExpired:
             process.kill()
-        return f"命令超过 {get_config().tools.shell_timeout} 秒，已中止。"
+        return f"命令超过 {timeout} 秒，已中止。"
     finally:
         with _shell_lock:
             if _shell_pgid == process.pid:
@@ -159,7 +160,18 @@ def run_shell_command(command, root):
     return clip_text(f"退出码 {process.returncode}\n{output}".strip())
 
 
-def run_tool(name, args, root, confirm):
+def _replace_failure(old, count):
+    preview = (old or "").strip().splitlines()
+    head = preview[0][:80] if preview else ""
+    if not old:
+        return "没有给出要替换的原文。"
+    if count == 0:
+        shown = f"原文开头是「{head}」。" if head else ""
+        return "没有找到这段原文，所以没有改文件。" + shown + "请按文件里现在的内容，重新给一段完整且只出现一次的原文。"
+    return f"这段原文出现了 {count} 次，没法确定改哪一处。请多带上前后几行，让它只出现一次。"
+
+
+def run_tool(name, args, root, confirm, undo=None):
     args = args or {}
     try:
         if name == "list_dir":
@@ -185,12 +197,14 @@ def run_tool(name, args, root, confirm):
             original = path.read_text(encoding="utf-8", errors="replace")
             count = original.count(old) if old else 0
             if not old or count != 1:
-                return f"原文需要唯一匹配，当前出现 {count} 次。"
+                return _replace_failure(old, count)
             preview = f"{path}\n\n--- 原文 ---\n{old[:4000]}\n\n--- 改为 ---\n{new[:4000]}"
             if not confirm(f"修改 {path.name}", preview):
                 return "用户拒绝了这次修改。"
+            noted = undo(path) if undo else "ok"
             path.write_text(original.replace(old, new, 1), encoding="utf-8")
-            return "已写入 " + str(path)
+            extra = "（文件较大，这次不能撤销）" if noted == "large" else ""
+            return "已写入 " + str(path) + extra
         if name == "write_file":
             path = scoped_path(root, args.get("path"))
             if looks_secret(path):
@@ -201,9 +215,11 @@ def run_tool(name, args, root, confirm):
             action = "覆盖" if path.exists() else "新建"
             if not confirm(f"{action} {path.name}", f"路径：{path}\n\n{content[:8000]}"):
                 return "用户拒绝了这次写入。"
+            noted = undo(path) if undo else "ok"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(content, encoding="utf-8")
-            return "已写入 " + str(path)
+            extra = "（文件较大，这次不能撤销）" if noted == "large" else ""
+            return "已写入 " + str(path) + extra
         if name == "shell":
             command = str(args.get("command") or "").strip()
             if not command:

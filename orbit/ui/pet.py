@@ -10,20 +10,27 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from PyQt5.QtCore import (
-    QAbstractAnimation, QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer, QEasingCurve, QPropertyAnimation, pyqtSignal,
+    QAbstractAnimation, QAbstractNativeEventFilter, QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer,
+    QEasingCurve, QPropertyAnimation, pyqtSignal,
 )
 from PyQt5.QtGui import QColor, QCursor, QPainter, QPen, QPolygon, QRegion
-from PyQt5.QtWidgets import QApplication, QDialog, QMenu, QMessageBox, QWidget
+from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox, QSystemTrayIcon, QWidget
 
 from orbit.agent.api_client import ApiError, CancelledApi, RetryableApiError, request_completion
-from orbit.agent.codex import CodexBridge
+from orbit.agent.codex import CodexBridge, find_codex
+from orbit.agent.safety import FileUndo, TaskGrants
 from orbit.agent.tools import API_TOOLS, api_error_text, kill_running_shell, run_tool, tool_label
-from orbit.config import get_config, load_api_token, load_user_settings, save_api_token, save_user_settings
+from orbit.config import (
+    BASE_CANVAS, BASE_PAINT_SCALE, follow_interval, get_config, load_api_token, load_user_settings,
+    mascot_scale, save_api_token, save_user_settings,
+)
+from orbit.session_store import load_idle, recall_window, save_idle, save_window
 from orbit.presets import preset_by_id
 from orbit.desktop.context import capture_context, context_prompt
-from orbit.desktop.common import hydrate_window, topmost_at
+from orbit.desktop.common import float_above, focus_window, hydrate_window, stack_with_window, topmost_at
 from orbit.theme import ACCENTS, KIND_LABELS
 from orbit.ui.chat import ChatWindow
+from orbit.ui.chrome import make_context_menu
 from orbit.ui.confirm import confirm_action
 from orbit.ui.notch import HomeNotch
 from orbit.ui.overlay import TargetOverlay
@@ -32,10 +39,49 @@ from orbit.desktop.autostart import set_login_autostart
 from orbit.ui.fonts import ui_font
 from orbit.ui.settings import SettingsDialog
 from orbit.ui.tether import TetherWindow
+from orbit.ui.tray import OrbitTray
 
 
 class ContextBridge(QObject):
     ready = pyqtSignal(int, str, object)
+
+
+class HotkeyFilter(QAbstractNativeEventFilter):
+    """Ctrl+Alt+Space arrives as WM_HOTKEY on the Qt thread."""
+
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+
+    def nativeEventFilter(self, eventType, message):
+        if os.name != "nt":
+            return False, 0
+        kind = eventType.decode("utf-8", "replace") if isinstance(eventType, (bytes, bytearray)) else str(eventType)
+        if "windows" not in kind.lower():
+            return False, 0
+        try:
+            import ctypes.wintypes
+            msg = ctypes.wintypes.MSG.from_address(int(message))
+            if msg.message == 0x0312:
+                self.callback()
+                return True, 0
+        except (TypeError, ValueError, OverflowError, OSError):
+            pass
+        return False, 0
+
+
+def history_from_messages(messages):
+    history = []
+    for item in messages or []:
+        author = item.get("author")
+        text = item.get("text") or ""
+        if not text.strip():
+            continue
+        if author == "你":
+            history.append({"role": "user", "content": text})
+        elif author not in ("工具", "错误"):
+            history.append({"role": "assistant", "content": text})
+    return history[-40:]
 
 
 class Pet(QWidget):
@@ -48,15 +94,9 @@ class Pet(QWidget):
         super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
-        # Keep a generous transparent canvas around the smaller painted mascot.
-        mascot = get_config().mascot
-        self.unit = mascot.scale
-        # Room above and beside the rest pose so squash, ears, and the badge
-        # stay inside the widget instead of being cut off by its edge.
-        self.pad = round(72 * self.unit)
-        self.setFixedSize(mascot.canvas_width + self.pad * 2, mascot.canvas_height + self.pad * 2)
-        self.pet_scale = mascot.paint_scale
-        self.pet_padding = 24 * self.unit
+        self.settings = load_user_settings()
+        self._mask_key = None
+        self.apply_mascot_scale(mascot_scale(self.settings))
         self.docked = True
         self.drag_growth = 1.
         self.drag_from_home = False
@@ -65,7 +105,6 @@ class Pet(QWidget):
         self.idle_kind = "blink"
         self.gaze_x = self.gaze_y = 0.
         self.notch = HomeNotch()
-        self.settings = load_user_settings()
         self.api_token = load_api_token()
         self.api_generation = 0
         self.api_round = 0
@@ -73,6 +112,10 @@ class Pet(QWidget):
         self.api_inflight = False
         self.api_tool_running = False
         self.api_history = []
+        self.grants = TaskGrants()
+        self.undo = FileUndo()
+        self._hotkey_id = 0x4F21
+        self._hotkey_on = False
         self.api_result.connect(self.api_finished)
         self.api_progress.connect(self.on_api_progress)
         self.tool_log.connect(self.on_tool_log)
@@ -82,11 +125,22 @@ class Pet(QWidget):
         self.context_pending = False
         self.pending_message = None
         self.bridge = CodexBridge()
+        self.bridge.grants = self.grants
+        self.bridge.undo = self.undo
         self.chat = ChatWindow()
         self.chat.set_backend_label(self.backend_label())
+        self.bridge.memory_provider = self.chat.recent_transcript
         self.chat.send.connect(self.ask)
         self.chat.stop.connect(self.stop_reply)
         self.chat.close_requested.connect(self.close_chat)
+        self.chat.reread.connect(self.reread_context)
+        self.chat.regenerate.connect(self.regenerate_last)
+        self.chat.changed.connect(self.persist_session)
+        idle = load_idle()
+        if idle["messages"] and self.chat.restore_messages(idle["messages"]):
+            self.api_history = list(idle["api_history"]) or history_from_messages(idle["messages"])
+        else:
+            self.chat.append(self.chat.assistant_name(), "你好！点击我可以随时聊天，也可以把我拖到窗口上一起工作。")
         self.bridge.status.connect(self.on_status)
         self.bridge.delta.connect(self.chat.add_delta)
         self.bridge.finished.connect(self.on_finished)
@@ -99,13 +153,14 @@ class Pet(QWidget):
         self.drag_start = None
         self.dragged = False
         self.target = None
+        self._transcript_window = None
+        self._history_loaded = False
         self.hover_target = None
         self.cached_windows = []
         self.held_id = None
         self.context_token = 0
         self.misses = 0
         self.dock_started = None
-        self._mask_key = None
         self.tether_from = None
         self.mood = "idle"
         self.mood_started = time.monotonic()
@@ -142,7 +197,7 @@ class Pet(QWidget):
         behavior = get_config().behavior
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.follow_target)
-        self.timer.start(behavior.follow_ms)
+        self.timer.start(follow_interval(self.settings))
         self.scan_timer = QTimer(self)
         self.scan_timer.timeout.connect(self.request_windows)
         self.scan_timer.start(behavior.scan_ms)
@@ -162,7 +217,13 @@ class Pet(QWidget):
         self.notch.reveal(screen)
         self.show()
         self.refresh_mask()
+        self.tray = None
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = OrbitTray(self)
         QTimer.singleShot(200, self.request_windows)
+        QTimer.singleShot(300, self.register_hotkey)
+        if self.settings.get("provider") != "api" and find_codex() is None:
+            QTimer.singleShot(500, lambda: self.chat.status.setText("未找到本机 Codex。可以在设置里改用 API，或先安装并登录 Codex CLI。"))
 
     def backend_label(self):
         if self.settings.get("provider") != "api":
@@ -211,8 +272,26 @@ class Pet(QWidget):
             self.slip += self.slip_v * frame
             self.lean_v += (-38 * self.lean - 9 * self.lean_v) * frame
             self.lean += self.lean_v * frame
+        if self.target and not self.docked and not self.buried and not self.drag_start:
+            self._raise_attached()
         self.refresh_mask()
         self.update()
+
+    def apply_mascot_scale(self, scale):
+        scale = min(3.0, max(0.35, float(scale)))
+        self.unit = scale
+        self.pad = round(72 * scale)
+        self.pet_scale = BASE_PAINT_SCALE * scale
+        self.pet_padding = 24 * scale
+        self.setFixedSize(
+            round(BASE_CANVAS[0] * scale) + self.pad * 2,
+            round(BASE_CANVAS[1] * scale) + self.pad * 2,
+        )
+        self._mask_key = None
+
+    def park_home(self):
+        screen = QApplication.primaryScreen().availableGeometry()
+        self.home = QPoint(screen.center().x() - self.width() // 2, screen.top() - self.pad)
 
     def placement(self):
         """Return the mascot's unscaled origin and scale inside the widget."""
@@ -258,10 +337,14 @@ class Pet(QWidget):
                 y, sx, sy = -6 * wave(3.6), 1 + .035 * wave(3.6), 1 - .02 * wave(3.6)
         elif self.mood == "dragging":
             sx, sy = 1.06 + .04 * wave(.68), .94 + .04 * (1 - wave(.68))
-        elif self.mood == "thinking":
-            y, sx, sy = -5 * wave(.9), 1 + .05 * wave(.9), 1 - .06 * wave(.9)
-        elif self.mood == "working":
-            y, sx, sy = 3 * wave(.42), 1 + .06 * wave(.42), 1 - .08 * wave(.42)
+        elif self.mood in ("thinking", "working"):
+            # No whole-body bounce while busy. Perched paws do the work in paintEvent;
+            # on the home notch, sway sideways only.
+            if self.target and not self.docked:
+                y, angle, sx, sy = 0., 0., 1., 1.
+            else:
+                y, sx, sy = 0., 1., 1.
+                angle = 7 * math.sin(elapsed * 2 * math.pi / .72)
         idle_progress = max(0., min(1., 1 - (self.idle_until - time.monotonic()) / .9))
         idle_wave = math.sin(idle_progress * math.pi) if time.monotonic() < self.idle_until else 0.
         if self.mood == "idle" and self.idle_kind == "hop":
@@ -285,7 +368,11 @@ class Pet(QWidget):
                     break
         elif self.landing_started is not None:
             landing_done = True
-        if holding and self.mood != "idle" and not (frames and progress < 1):
+        if holding and self.mood in ("thinking", "working") and not (frames and progress < 1):
+            # Keep the body planted while busy; only follow hard window motion.
+            y += self.slip * 0.25
+            angle += self.lean * 0.25
+        elif holding and self.mood not in ("idle", "thinking", "working") and not (frames and progress < 1):
             y += self.slip * 0.6
             angle += self.lean * 0.65
             sx += .05 * self.grip
@@ -328,8 +415,12 @@ class Pet(QWidget):
         region = region.united(cover(61, 15, 20))
         show_paws = bool(self.target) and not self.docked
         if show_paws:
-            region = region.united(cover(25, 74, 16))
-            region = region.united(cover(57, 74, 16))
+            # Cover the working stroke range so alternating paws stay clickable.
+            region = region.united(cover(25, 74, 18))
+            region = region.united(cover(57, 74, 18))
+            if self.mood in ("thinking", "working"):
+                region = region.united(cover(25, 64, 18))
+                region = region.united(cover(57, 64, 18))
         if self.mood in ("thinking", "working", "done"):
             region = region.united(cover(70, 10, 18))
         if self.landing_started is not None:
@@ -370,7 +461,12 @@ class Pet(QWidget):
         try:
             context = capture_context(snapshot)
         except Exception:
-            context = {"kind": snapshot.get("kind") or "other", "accent": ACCENTS["other"], "summary": "没能读取这个窗口的路径"}
+            context = {
+                "kind": snapshot.get("kind") or "other",
+                "accent": ACCENTS["other"],
+                "summary": "没能读取这个窗口的路径",
+                "detail_level": "title",
+            }
         self.context_bridge.ready.emit(token, window_id, context)
 
     def apply_context(self, token, window_id, context):
@@ -379,11 +475,21 @@ class Pet(QWidget):
         self.target.update(context)
         self.context_pending = False
         self.chat.set_context(self.target)
-        if self.chat.message_layout.count() <= 2:
+        self.note_grant()
+        if not self._history_loaded:
+            record = recall_window(self.target)
+            if record and record.get("messages") and not self.chat.has_user_message():
+                self.api_history = list(record["api_history"]) or history_from_messages(record["messages"])
+                self.chat.restore_messages(record["messages"])
+                self._history_loaded = True
+                self.chat.append(self.chat.assistant_name(), "已接上这个窗口上次的对话。")
+        if not self._history_loaded and not self.chat.has_user_message():
             self.chat.reset_messages()
-            self.chat.append("Codex", self.connection_message(self.target))
+        self.chat.append(self.chat.assistant_name(), self.connection_message(self.target))
+        self._remember_current()
         if not self.buried:
             self.overlay.set_target(self.target, False, connected=True)
+            self._raise_attached()
         if self.pending_message:
             message = self.pending_message
             self.pending_message = None
@@ -392,20 +498,27 @@ class Pet(QWidget):
     def connection_message(self, target):
         path = target.get("path")
         kind = target.get("kind")
+        level = target.get("detail_level") or "title"
+        title = target.get("title") or "窗口"
         if path and kind == "files":
             names = "、".join(item.rstrip("/") for item in (target.get("entries") or [])[:8])
-            listing = f"我看到这些项目：{names}。" if names else ""
-            return f"已连接「{target['title']}」。路径是 {path}。{listing}可以直接让我处理这里的文件。"
-        if path and kind == "editor":
-            read = "我已经读到文件开头。" if target.get("preview") else "这个文件不是可预览的文本。"
-            return f"已连接「{target['title']}」。当前文件是 {path}。{read}"
+            listing = f"我看到这些项目：{names}。" if names else "目录是空的，或没能列出内容。"
+            return f"已连接「{title}」。读到的是文件夹 {path}。{listing}"
+        if kind == "editor" and path and level == "file":
+            return f"已连接「{title}」。读到的是文件开头：{path}。换文件后点「重新读取」。"
+        if kind == "editor" and path:
+            return f"已连接「{title}」。只定位到 {path}，没有读到正文。可以点「重新读取」。"
+        if kind == "editor":
+            return f"已连接「{title}」。没有从标题里定位到文件，所以还不能读正文。"
         if path and kind == "terminal":
-            return f"已连接终端「{target['title']}」。当前目录是 {path}。"
-        if target.get("url"):
-            return f"已连接「{target['title']}」。页面地址是 {target['url']}。"
+            return f"已连接终端「{title}」。读到的当前目录是 {path}。"
+        if kind == "browser" and target.get("url"):
+            return f"已连接「{title}」。只拿到地址 {target['url']}，没有页面正文。需要正文时我会尝试抓取这个地址。"
+        if kind == "browser":
+            return f"已连接「{title}」。现在只有窗口标题，没有页面地址和正文，不能据此编造内容。"
         if path:
-            return f"已连接「{target['title']}」。相关路径是 {path}。"
-        return f"已连接「{target['title']}」。我认出了{KIND_LABELS.get(kind, '窗口')}，但没有解析出可操作的路径。"
+            return f"已连接「{title}」。相关路径是 {path}。"
+        return f"已连接「{title}」。只认出了{KIND_LABELS.get(kind, '窗口')}，没有解析出可操作的路径或正文。"
 
     def set_mood(self, mood):
         if self.mood != mood: self.mood_started = time.monotonic()
@@ -494,11 +607,13 @@ class Pet(QWidget):
         painter.setBrush(QColor("#2d2d31"))
         lift_left = lift_right = 0
         if self.target and not self.docked:
-            tap = (1 - math.cos(elapsed * 2 * math.pi / .48)) / 2 if self.mood == "working" else 0
-            lift_left = 5 * tap if self.mood == "working" else 0
-            lift_right = 5 * (1 - tap) if self.mood == "working" else 0
             dig = 5 * self.grip + max(0., -self.slip) * 0.45
             spread = 2.6 * self.grip
+            # Busy perched work: paws alternate up/down.
+            if self.mood in ("thinking", "working"):
+                tap = (1 - math.cos(elapsed * 2 * math.pi / .36)) / 2
+                lift_left = 10 * tap
+                lift_right = 10 * (1 - tap)
             painter.drawEllipse(int(16 - spread), int(66 + dig - lift_left), 18, 16)
             painter.drawEllipse(int(48 + spread), int(66 + dig - lift_right), 18, 16)
         painter.drawEllipse(11, 11, 60, 60)
@@ -557,6 +672,7 @@ class Pet(QWidget):
             self.press_center = self.visual_center()
             self.drag_from_home = self.docked
             self.held_id = self.target["id"] if self.target else None
+            self._transcript_window = self._window_snapshot(self.target)
             self.dock_started = None
             self.tether_from = self.press_center
             self.dragged = False
@@ -611,8 +727,7 @@ class Pet(QWidget):
                 pool = self.cached_windows if self.settings.get("attach", True) else []
                 self.hover_target = topmost_at(pool, self.visual_center())
                 self.overlay.set_target(self.hover_target, self.settings.get("hints", True))
-                self.chat.hide()
-                self.raise_()
+                self._float_layer()
                 self.update()
 
     def mouseReleaseEvent(self, event):
@@ -626,73 +741,100 @@ class Pet(QWidget):
         self.overlay.set_target(None)
         self.update()
         if was_dragged:
-            self.target = self.hover_target
-            if self.drag_from_home and self.target:
-                self._close_notch_after_snap = True
+            landed = self.hover_target
             self.hover_target = None
-            if self.target and self.target["id"] == self.held_id:
+            if self.drag_from_home and landed:
+                self._close_notch_after_snap = True
+            if landed and landed["id"] == self.held_id:
+                self.target = landed
+                focus_window(landed["id"])
+                self._transcript_window = None
                 self.bounce = 10
                 self.landing_started = time.monotonic()
                 self.probe.watch(self.target["id"], self.own_window_ids())
                 self.follow_target()
                 if self.settings.get("auto_open", True):
                     QTimer.singleShot(260, self.open_chat)
-            elif self.target:
-                self.cancel_api()
-                self.end_activity()
-                self.api_history.clear()
-                self.bridge.invalidate()
-                self.chat.set_context(self.target)
-                self.chat.reset_messages()
-                self.chat.append("Codex", f"已放在「{self.target['title']}」上，正在读取路径和内容…")
-                self.chat.send_button.setEnabled(True)
-                self.chat.stop_button.hide()
-                self.begin_context(self.target)
-                self.bounce = 10
-                self.landing_started = time.monotonic()
-                self.probe.watch(self.target["id"], self.own_window_ids())
-                self.follow_target()
-                if self.settings.get("auto_open", True):
-                    QTimer.singleShot(260, self.open_chat)
+            elif landed:
+                self._land_on(landed)
             else:
-                self.probe.unwatch()
-                self.live_rect = None
-                self.context_token += 1
-                self.context_pending = False
-                self.pending_message = None
-                self.cancel_api()
-                self.end_activity()
-                self.api_history.clear()
-                self.bridge.invalidate()
-                self.chat.set_context(None)
-                self.chat.reset_messages()
-                self.chat.append("Codex", "已回到待命状态。你可以直接聊天，或把我拖到另一个窗口。")
-                self.chat.send_button.setEnabled(True)
-                self.chat.stop_button.hide()
-                self.go_home()
+                self.return_home()
             self.set_mood("idle")
             return
-        if self.chat.isVisible(): self.chat.hide()
-        else: self.open_chat()
+        if self.target:
+            focus_window(self.target["id"])
+        if self.chat.isVisible():
+            self.chat.activateWindow()
+            self.chat.input.setFocus(Qt.ActiveWindowFocusReason)
+            if self.target:
+                self._raise_attached()
+            else:
+                self._float_layer()
+        else:
+            self.open_chat()
 
-    def contextMenuEvent(self, event):
-        menu = QMenu(self)
-        menu.setFont(ui_font(13))
-        menu.addAction("打开对话", self.open_chat)
-        menu.addAction("设置", self.open_settings)
+    def fill_orbit_menu(self, menu):
+        """Shared actions for the mascot menu and the tray menu."""
+        menu.addAction("打开对话", self.reveal_from_tray)
+        menu.addAction("设置…", self.open_settings)
+        menu.addSeparator()
         menu.addAction("回到顶部", self.detach)
         menu.addAction("清空对话", self.clear_conversation)
         if self.target:
+            menu.addAction("重新读取", self.reread_context)
             menu.addAction("断开窗口", self.detach)
+        if self.undo.stack:
+            menu.addAction("撤销上次修改", self.undo_last_edit)
         menu.addSeparator()
-        menu.addAction("退出 Orbit", QApplication.instance().quit)
+        menu.addAction("退出 Orbit", self.quit_orbit)
+
+    def contextMenuEvent(self, event):
+        menu = make_context_menu(self)
+        self.fill_orbit_menu(menu)
         menu.exec_(event.globalPos())
+
+    def reveal_from_tray(self):
+        """Bring the mascot and chat forward, like clicking a QQ tray icon."""
+        if self.buried:
+            self.apply_cover(False)
+        self.show()
+        self.raise_()
+        if self.docked:
+            self.notch.reveal(self._home_screen().availableGeometry())
+        self.open_chat()
+
+    def quit_orbit(self):
+        self.persist_session()
+        self.unregister_hotkey()
+        if self.tray is not None:
+            self.tray.hide()
+        QApplication.instance().quit()
 
     def own_window_ids(self):
         return {int(widget.winId()) for widget in QApplication.topLevelWidgets()}
 
+    def _layer_hwnds(self):
+        """Border, mascot, then dialog. The dialog stays above the mascot, both above the border."""
+        hwnds = []
+        if self.overlay.isVisible():
+            hwnds.append(int(self.overlay.winId()))
+        hwnds.append(int(self.winId()))
+        if self.chat.isVisible() and not self.buried:
+            hwnds.append(int(self.chat.winId()))
+        return hwnds
+
+    def _raise_attached(self):
+        """Keep the mascot, border, and dialog in the attached window's z-order band."""
+        if not self.target or self.drag_start:
+            return
+        stack_with_window(self.target["id"], self._layer_hwnds())
+
+    def _float_layer(self):
+        """Perch and drag stay above other apps so the mascot can be picked up."""
+        float_above(self._layer_hwnds())
+
     def apply_cover(self, covered):
-        """Hide with the attached window when a higher window covers it."""
+        """Hide with the attached window when it is covered, minimized, or hidden."""
         if covered:
             if self.buried:
                 return
@@ -706,7 +848,7 @@ class Pet(QWidget):
             return
         self.buried = False
         self.show()
-        self.raise_()
+        self._raise_attached()
         if self.chat_was_open:
             self.chat_was_open = False
             self.open_chat()
@@ -722,10 +864,15 @@ class Pet(QWidget):
         if opening:
             self.chat.move(destination.x(), destination.y() - 18)
             self.chat.setWindowOpacity(0)
+        if self.target and not self.drag_start:
+            focus_window(self.target["id"])
         self.chat.show()
-        self.chat.raise_()
         self.chat.activateWindow()
         self.chat.input.setFocus(Qt.ActiveWindowFocusReason)
+        if self.target and not self.drag_start:
+            self._raise_attached()
+        else:
+            self._float_layer()
         QTimer.singleShot(0, self.chat.input.setFocus)
         if opening:
             self.chat_motion.stop()
@@ -739,14 +886,168 @@ class Pet(QWidget):
             self.chat_fade.setEndValue(1)
             self.chat_fade.start()
 
-    def close_chat(self):
-        self.chat.hide()
-        if self.target: self.detach()
+    def _window_snapshot(self, window):
+        if not window:
+            return None
+        return {
+            "id": window.get("id"),
+            "title": window.get("title") or "",
+            "app": window.get("app") or "",
+            "kind": window.get("kind") or "other",
+            "path": window.get("path"),
+        }
 
-    def clear_conversation(self):
+    def _active_window(self):
+        # While dragging, the live target is cleared. Keep saving under the window we left.
+        if self._transcript_window:
+            return self._transcript_window
+        return self.target
+
+    def _remember_current(self):
+        window = self._active_window()
+        messages = self.chat.export_messages()
+        if window:
+            save_window(window, messages, self.api_history)
+        else:
+            save_idle(messages, self.api_history)
+
+    def _load_transcript(self, record):
+        self.api_history = list(record.get("api_history") or []) or history_from_messages(record.get("messages"))
+        self.chat.restore_messages(record.get("messages") or [])
+        self._history_loaded = True
+
+    def _load_idle(self):
+        record = load_idle()
+        self._history_loaded = False
+        if record.get("messages"):
+            self._load_transcript(record)
+            return
+        self.api_history.clear()
+        self.chat.reset_messages()
+        self.chat.append(self.chat.assistant_name(), "已回到顶部。把我拖到窗口上，可以接着那个窗口上次的对话。")
+
+    def _land_on(self, window):
+        """Save the conversation we left, then open this window's own history."""
+        self._remember_current()
+        self.pause_work()
+        self.grants.clear()
+        self.bridge.invalidate()
+        self._transcript_window = None
+        self.target = window
+        focus_window(window.get("id"))
+        self.chat.set_context(window)
+        record = recall_window(window)
+        name = self.chat.assistant_name()
+        title = window.get("title") or "窗口"
+        if record and record.get("messages"):
+            self._load_transcript(record)
+            self.chat.append(name, f"已连上「{title}」，接着上次的对话。正在重新读取…")
+        else:
+            self._history_loaded = False
+            self.api_history.clear()
+            self.chat.reset_messages()
+            self.chat.append(name, f"已放在「{title}」上，正在读取实际能读到的内容…")
+        self.chat.send_button.setEnabled(True)
+        self.chat.stop_button.hide()
+        self.begin_context(window)
+        self.bounce = 10
+        self.landing_started = time.monotonic()
+        self.probe.watch(window["id"], self.own_window_ids())
+        self.follow_target()
+        if self.settings.get("auto_open", True):
+            QTimer.singleShot(260, self.open_chat)
+        self.set_mood("idle")
+
+    def pause_work(self):
+        self.pending_message = None
         self.cancel_api()
         self.end_activity()
-        self.pending_message = None
+        self.bridge.stop()
+
+    def reset_dialogue(self):
+        self.api_history.clear()
+        self.grants.clear()
+        self.undo.clear()
+        self.bridge.invalidate()
+        self.chat.reset_messages()
+        self.persist_session()
+
+    def note_grant(self):
+        if self.grants.active():
+            self.chat.footnote.setText("✦ 本次任务内，此目录的修改和命令不必再逐条确认")
+
+    def persist_session(self, *_args):
+        self._remember_current()
+
+    def reread_context(self):
+        if not self.target:
+            return
+        self.chat.append(self.chat.assistant_name(), "正在重新读取当前窗口…")
+        self.begin_context(self.target)
+
+    def regenerate_last(self):
+        text = self.chat.last_user_text()
+        if not text or not self.chat.send_button.isEnabled():
+            return
+        self.chat.drop_replies_after_last_user()
+        while self.api_history and self.api_history[-1].get("role") != "user":
+            self.api_history.pop()
+        if self.api_history and self.api_history[-1].get("role") == "user":
+            self.api_history.pop()
+        self.chat.send_button.setEnabled(False)
+        self.chat.retry_button.hide()
+        self.chat.stop_button.show()
+        self.ask(text)
+
+    def undo_last_edit(self):
+        self.chat.append(self.chat.assistant_name(), self.undo.undo())
+
+    def register_hotkey(self):
+        if os.name != "nt" or self._hotkey_on:
+            return
+        try:
+            import ctypes
+            user32 = ctypes.windll.user32
+            modifiers = 0x0001 | 0x0002 | 0x4000
+            if not user32.RegisterHotKey(int(self.winId()), self._hotkey_id, modifiers, 0x20):
+                return
+            self._hotkey_on = True
+            self._hotkey_filter = HotkeyFilter(self.reveal_from_tray)
+            QApplication.instance().installNativeEventFilter(self._hotkey_filter)
+        except (AttributeError, OSError, TypeError):
+            self._hotkey_on = False
+
+    def unregister_hotkey(self):
+        if os.name != "nt" or not self._hotkey_on:
+            return
+        try:
+            import ctypes
+            ctypes.windll.user32.UnregisterHotKey(int(self.winId()), self._hotkey_id)
+        except (AttributeError, OSError, TypeError):
+            pass
+        self._hotkey_on = False
+
+    def nativeEvent(self, eventType, message):
+        if os.name == "nt" and self._hotkey_on:
+            try:
+                import ctypes.wintypes
+                msg = ctypes.wintypes.MSG.from_address(int(message))
+                if msg.message == 0x0312:
+                    self.reveal_from_tray()
+                    return True, 0
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
+        return super().nativeEvent(eventType, message)
+
+    def close_chat(self):
+        self.chat.hide()
+        if self.target or not self.docked:
+            self.return_home()
+
+    def clear_conversation(self):
+        self.pause_work()
+        self.grants.clear()
+        self.undo.clear()
         self.api_history.clear()
         self.bridge.invalidate()
         self.chat.clear_messages()
@@ -754,15 +1055,20 @@ class Pet(QWidget):
         self.chat.stop_button.hide()
         self.set_mood("idle")
 
-    def detach(self):
+    def detach(self, ask=True):
+        self.return_home()
+
+    def return_home(self):
+        """Save the window conversation, then perch at the top of the screen."""
+        self._remember_current()
         self.context_token += 1
         self.context_pending = False
-        self.pending_message = None
-        self.cancel_api()
-        self.end_activity()
-        self.api_history.clear()
+        self.pause_work()
+        self.grants.clear()
         self.bridge.invalidate()
         self.target = None
+        self._transcript_window = None
+        self._history_loaded = False
         self.live_rect = None
         self.buried = False
         self.chat_was_open = False
@@ -775,7 +1081,9 @@ class Pet(QWidget):
         self.chat.send_button.setEnabled(True)
         self.chat.stop_button.hide()
         self.chat.hide()
+        self._load_idle()
         self.go_home()
+        self._float_layer()
         self.set_mood("idle")
         self.update()
 
@@ -788,13 +1096,12 @@ class Pet(QWidget):
             return
         current = next((window for window in self.cached_windows if window["id"] == self.target["id"]), None)
         if not current:
-            self.misses += 1
-            if self.misses >= 3:
-                self.detach()
+            # Minimized/hidden targets leave the visible list; the watch loop owns
+            # bury/restore and only detaches when the window is gone.
             return
         self.misses = 0
         title_changed = current["title"] != self.target.get("title")
-        preserved = {key: self.target.get(key) for key in ("path", "entries", "preview", "summary", "accent", "url")}
+        preserved = {key: self.target.get(key) for key in ("path", "entries", "preview", "summary", "accent", "url", "detail_level")}
         self.target = current
         if not title_changed:
             self.target.update({key: value for key, value in preserved.items() if value is not None})
@@ -806,6 +1113,7 @@ class Pet(QWidget):
             return
         self.overlay.set_target(self.target, False, connected=True)
         self.place_on_window(rect, allow_bounce=True)
+        self._raise_attached()
         if title_changed:
             self.begin_context(self.target)
         self.update()
@@ -814,9 +1122,16 @@ class Pet(QWidget):
         if self.drag_start or not self.target or self.target.get("id") != wid:
             return
         if payload is None:
+            # Target window was destroyed or became invalid.
             self.misses += 1
             if self.misses >= 4:
-                self.detach()
+                self.detach(ask=False)
+            return
+        if payload == ("hidden",):
+            # Minimized, cloaked, or otherwise not visible — follow the window away.
+            self.ride_vx = self.ride_vy = 0.
+            self.misses = 0
+            self.apply_cover(True)
             return
         rect, covered = payload
         self.misses = 0
@@ -845,6 +1160,7 @@ class Pet(QWidget):
         if revealed:
             self.overlay.show()
         self.place_on_window(new_rect, allow_bounce=not moved and not revealed)
+        self._raise_attached()
 
     def working_directory(self):
         fallback = Path(self.settings.get("cwd") or Path.home()).expanduser()
@@ -861,14 +1177,14 @@ class Pet(QWidget):
         return str(Path.home())
 
     def begin_activity(self, label):
-        """Show a live timer and the working animation until the task ends."""
+        """Show a live timer and the busy-hand animation until the task ends."""
         now = time.monotonic()
         self.activity_started = now
         self.activity_touch = now
         self.activity_label = label
         self.activity_warned = False
         self.chat.set_busy_status(label, 0)
-        self.set_mood("thinking")
+        self.set_mood("working")
 
     def touch_activity(self, label=None, working=False):
         if self.activity_started is None:
@@ -880,7 +1196,7 @@ class Pet(QWidget):
             self.activity_label = label
         elapsed = int(time.monotonic() - self.activity_started)
         self.chat.set_busy_status(self.activity_label, elapsed)
-        self.set_mood("working" if working else "thinking")
+        self.set_mood("working")
 
     def end_activity(self):
         self.activity_started = None
@@ -895,10 +1211,11 @@ class Pet(QWidget):
         stalled = quiet >= 90
         self.chat.set_busy_status(self.activity_label, elapsed, stalled=stalled)
         if self.mood == "idle":
-            self.set_mood("thinking")
+            self.set_mood("working")
         if stalled and not self.activity_warned:
             self.activity_warned = True
-            self.chat.append("Orbit", "已经有一会儿没有新进展。任务可能卡住了，可以点「结束任务」停下来。")
+            label = self.activity_label or "当前步骤"
+            self.chat.append(self.chat.assistant_name(), f"「{label}」已经约 90 秒没有新进展。可以点「结束任务」，或再等一会儿。")
 
     def ask(self, message):
         if self.target and self.context_pending:
@@ -906,7 +1223,7 @@ class Pet(QWidget):
             self.begin_activity("正在读取窗口路径")
             return
         self.begin_activity("正在准备")
-        self.set_mood("thinking")
+        self.set_mood("working")
         if self.settings.get("provider") == "api":
             self.ask_api(message)
             return
@@ -1006,6 +1323,10 @@ class Pet(QWidget):
                 self.continue_tools(message_obj, tool_calls)
                 return
             answer = message_obj.get("content") or ""
+            if tool_calls:
+                limit = get_config().api.max_rounds
+                note = f"已连续调用工具 {limit} 次，达到上限，这次先停下来。再说一次「继续」就可以接着做。"
+                answer = (answer.strip() + "\n\n" + note).strip() if isinstance(answer, str) and answer.strip() else note
             if not isinstance(answer, str) or not answer.strip():
                 answer = message_obj.get("reasoning_content") or ""
             if not isinstance(answer, str) or not answer.strip():
@@ -1028,24 +1349,42 @@ class Pet(QWidget):
         if message_obj.get("reasoning_content"):
             assistant["reasoning_content"] = message_obj["reasoning_content"]
         if content.strip():
-            self.chat.append("Codex", content.strip())
+            self.chat.append(self.chat.assistant_name(), content.strip())
         threading.Thread(
             target=self._run_tool_round,
             args=(generation, root, blocked, assistant, tool_calls),
             daemon=True,
         ).start()
 
-    def _confirm_from_worker(self, title, detail):
+    def _tool_confirm(self, title, detail):
+        root = self.working_directory()
+        file_change = any(word in title for word in ("修改", "覆盖", "新建", "写入"))
+        command = "命令" in title
+        if file_change and self.grants.files_ok(root):
+            return True
+        if command and self.grants.shell_ok(root):
+            return True
+        decision = self._confirm_from_worker(title, detail, allow_task=file_change or command)
+        if decision == "task":
+            if file_change:
+                self.grants.allow_files(root)
+            if command:
+                self.grants.allow_shell(root)
+            self.note_grant()
+            return True
+        return decision == "once"
+
+    def _confirm_from_worker(self, title, detail, allow_task=True):
         if QThread.currentThread() is self.thread():
-            return confirm_action(title, detail, self.chat)
+            return confirm_action(title, detail, self.chat, allow_task=allow_task)
         box = {}
-        self._confirm_box = (title, detail, box)
+        self._confirm_box = (title, detail, allow_task, box)
         self.confirm_request.emit()
-        return bool(box.get("ok"))
+        return box.get("decision", "deny")
 
     def _confirm_on_gui(self):
-        title, detail, box = self._confirm_box
-        box["ok"] = confirm_action(title, detail, self.chat)
+        title, detail, allow_task, box = self._confirm_box
+        box["decision"] = confirm_action(title, detail, self.chat, allow_task=allow_task)
 
     def on_tool_log(self, author, text):
         self.chat.append(author, text)
@@ -1075,7 +1414,7 @@ class Pet(QWidget):
                 if blocked and name != "fetch_url":
                     output = "当前窗口还没有解析出目录，已拒绝改用主目录。"
                 else:
-                    output = run_tool(name, args, root, self._confirm_from_worker)
+                    output = run_tool(name, args, root, self._tool_confirm, self.undo.remember)
             follow.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": output})
         if self.api_generation != generation:
             self.api_tool_running = False
@@ -1087,9 +1426,14 @@ class Pet(QWidget):
         self.context_pending = False
         self.context_token += 1
         kill_running_shell()
+        self.grants.clear()
         self.cancel_api()
         self.bridge.stop()
         self.end_activity()
+        if self.target:
+            self.chat.footnote.setText("✦ 写入和命令会先确认，可对本目录选择本次允许")
+        else:
+            self.chat.footnote.setText(f"✦ {self.chat.backend_label} · Enter 发送，Shift+Enter 换行")
         self.on_finished("已结束这次任务。")
         self.chat.status.setText("已结束任务")
 
@@ -1104,6 +1448,8 @@ class Pet(QWidget):
         self.set_mood("idle")
 
     def on_status(self, message):
+        if self.grants.active():
+            self.note_grant()
         if self.activity_started is None:
             return
         self.touch_activity(message, working=("执行" in message or "回复" in message or "操作" in message))
@@ -1128,10 +1474,21 @@ class Pet(QWidget):
         self.settings = {"cwd": cwd, "attach": dialog.auto_attach.isChecked(),
                          "auto_open": dialog.auto_open.isChecked(), "hints": dialog.hints.isChecked(),
                          "provider": chosen["provider"], "preset": chosen["preset"],
-                         "endpoint": chosen["endpoint"], "model": chosen["model"]}
+                         "endpoint": chosen["endpoint"], "model": chosen["model"],
+                         "scale": dialog.scale.value() / 100,
+                         "follow_ms": dialog.follow.value(),
+                         "shell_timeout": dialog.shell_timeout.value()}
         self.api_token = dialog.token.text().strip()
         save_user_settings(self.settings)
         save_api_token(self.api_token)
+        self.apply_mascot_scale(self.settings["scale"])
+        self.timer.setInterval(int(self.settings["follow_ms"]))
+        self.park_home()
+        if self.target and self.target.get("rect") is not None:
+            self.place_on_window(self.target["rect"])
+        elif self.docked:
+            self.move(self.home)
+        self.refresh_mask()
         self.chat.set_backend_label(self.backend_label())
         self.set_autostart(dialog.autostart.isChecked())
 

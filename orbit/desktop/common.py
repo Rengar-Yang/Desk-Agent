@@ -1,5 +1,7 @@
 """Window helpers shared by the X11 and Windows desktops."""
 
+import os
+
 from PyQt5.QtCore import QRect
 
 FILES_EXACT = {"explorer.exe", "explorer"}
@@ -87,6 +89,38 @@ def topmost_at(windows, point):
         if area.contains(point):
             return window
     return None
+
+
+def _desktop_call(win32_name, x11_name, *args):
+    try:
+        if os.name == "nt":
+            from orbit.desktop import win32 as desktop
+        else:
+            from orbit.desktop import x11 as desktop
+        getattr(desktop, win32_name if os.name == "nt" else x11_name)(*args)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return
+
+
+def focus_window(wid):
+    """Bring an attached window to the front of the normal window stack."""
+    if not wid:
+        return
+    _desktop_call("focus_window", "focus_window", wid)
+
+
+def stack_with_window(owner, hwnds):
+    """Place hwnds just above owner and under whatever already covers owner."""
+    if not owner or not hwnds:
+        return
+    _desktop_call("stack_with_window", "stack_with_window", owner, hwnds)
+
+
+def float_above(hwnds):
+    """Keep these windows above ordinary apps. Used while Orbit is perched or dragged."""
+    if not hwnds:
+        return
+    _desktop_call("float_above", "float_above", hwnds)
 
 
 def hydrate_window(window):

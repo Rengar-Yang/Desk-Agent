@@ -1,5 +1,6 @@
 """Enumerate and measure X11 windows."""
 
+import ctypes
 import os
 import re
 import subprocess
@@ -130,22 +131,30 @@ def visible_window_rect(values, props):
     return (x, y, width, height)
 
 
-def query_window_rect(wid):
-    """Visible rect of one window, or None when it is gone or hidden."""
+def query_window_presence(wid):
+    """Return ('gone', None), ('hidden', None), or ('visible', rect)."""
     geo = run_x("xwininfo", "-id", wid)
+    if not geo.strip() or "error:" in geo.lower() or "no such window" in geo.lower():
+        return "gone", None
     if "Map State: IsViewable" not in geo:
-        return None
+        return "hidden", None
     values = {}
     for key in ("Absolute upper-left X", "Absolute upper-left Y", "Width", "Height"):
         match = re.search(rf"{re.escape(key)}:\s*(-?\d+)", geo)
         if match:
             values[key] = int(match.group(1))
     if len(values) != 4 or values["Width"] < 80 or values["Height"] < 60:
-        return None
+        return "hidden", None
     props = run_x("xprop", "-id", wid, "_GTK_FRAME_EXTENTS", "_NET_FRAME_EXTENTS", "_NET_WM_STATE")
     if "_NET_WM_STATE_HIDDEN" in props:
-        return None
-    return visible_window_rect(values, props)
+        return "hidden", None
+    return "visible", visible_window_rect(values, props)
+
+
+def query_window_rect(wid):
+    """Visible rect of one window, or None when it is gone or hidden."""
+    state, rect = query_window_presence(wid)
+    return rect if state == "visible" else None
 
 
 def unescape_xprop(text):
@@ -232,3 +241,88 @@ def window_is_covered(wid, rect, own_ids, cache):
         if cached[1] and window_covers(rect, cached[1]):
             return True
     return False
+
+
+def _xlib():
+    try:
+        return ctypes.cdll.LoadLibrary("libX11.so.6")
+    except OSError:
+        return None
+
+
+def _prepare_xlib(lib):
+    lib.XOpenDisplay.restype = ctypes.c_void_p
+    lib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    lib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+    lib.XFlush.argtypes = [ctypes.c_void_p]
+    lib.XConfigureWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_uint, ctypes.c_void_p]
+    lib.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+
+
+def stack_with_window(owner, followers):
+    """Place followers immediately above owner, lowest hwnd first."""
+    lib = _xlib()
+    if lib is None:
+        return
+    _prepare_xlib(lib)
+    display = lib.XOpenDisplay(None)
+    if not display:
+        return
+    try:
+        changes = _XWindowChanges()
+        changes.stack_mode = 0  # Above
+        sibling = int(owner)
+        mask = (1 << 5) | (1 << 6)  # CWSibling | CWStackMode
+        for hwnd in followers:
+            changes.sibling = sibling
+            lib.XConfigureWindow(display, int(hwnd), mask, ctypes.byref(changes))
+            sibling = int(hwnd)
+        lib.XFlush(display)
+    except (OSError, TypeError, ValueError):
+        return
+    finally:
+        lib.XCloseDisplay(display)
+
+
+def float_above(hwnds):
+    lib = _xlib()
+    if lib is None:
+        return
+    _prepare_xlib(lib)
+    display = lib.XOpenDisplay(None)
+    if not display:
+        return
+    try:
+        for hwnd in hwnds:
+            lib.XRaiseWindow(display, int(hwnd))
+        lib.XFlush(display)
+    except (OSError, TypeError, ValueError):
+        return
+    finally:
+        lib.XCloseDisplay(display)
+
+
+class _XWindowChanges(ctypes.Structure):
+    _fields_ = [
+        ("x", ctypes.c_int),
+        ("y", ctypes.c_int),
+        ("width", ctypes.c_int),
+        ("height", ctypes.c_int),
+        ("border_width", ctypes.c_int),
+        ("sibling", ctypes.c_ulong),
+        ("stack_mode", ctypes.c_int),
+    ]
+
+
+def focus_window(wid):
+    """Ask the window manager to raise this window above other normal windows."""
+    token = wid if isinstance(wid, str) else hex(int(wid))
+    for command in (
+        ["xdotool", "windowactivate", token],
+        ["wmctrl", "-ia", token],
+    ):
+        try:
+            subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.6, check=False)
+            return
+        except (OSError, subprocess.SubprocessError):
+            continue
