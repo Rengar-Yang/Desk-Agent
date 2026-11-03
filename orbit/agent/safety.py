@@ -63,6 +63,11 @@ class FileUndo:
         del self.stack[:-self.limit]
         return "ok"
 
+    def discard(self):
+        """Drop the newest snapshot when a write did not happen."""
+        if self.stack:
+            self.stack.pop()
+
     def undo(self):
         if not self.stack:
             return "没有可以撤销的文件修改。"

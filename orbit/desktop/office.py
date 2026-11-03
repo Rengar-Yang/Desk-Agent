@@ -102,53 +102,339 @@ public class OrbitActiveOffice {
   if (-not $chosen) { $chosen = $named }
   if (-not $chosen -and $docs.Count -eq 1) { $chosen = $docs[0] }
   if (-not $chosen) { Write-Result @{ status = "noapp" }; exit 0 }
-  if ($action -eq "read") {
+  foreach ($app in $apps) { try { $app.DisplayAlerts = 0 } catch {} }
+  function Get-ParagraphBody($para) {
+    $range = $para.Range.Duplicate
+    try { $null = $range.MoveEnd(1, -1) } catch {}
+    try { return [string]$range.Text } catch { return "" }
+  }
+  function Get-Paragraphs($doc) {
+    $items = @()
+    try { $collection = $doc.Paragraphs } catch { return $items }
+    $total = 0
+    try { $total = [int]$collection.Count } catch { return $items }
+    for ($i = 1; $i -le $total; $i++) {
+      try { $items += $collection.Item($i) } catch {}
+    }
+    return $items
+  }
+  function Get-Numbered($doc) {
+    $found = @()
+    foreach ($para in (Get-Paragraphs $doc)) {
+      $body = (Get-ParagraphBody $para).Trim()
+      if ($body) { $found += $para }
+    }
+    return $found
+  }
+  function Save-Doc($doc) {
+    try { $doc.Save() } catch {}
+  }
+  function Set-BodyText($para, $value) {
+    $range = $para.Range.Duplicate
+    try { $null = $range.MoveEnd(1, -1) } catch {}
+    $range.Text = (([string]$value) -replace "`n", "`r")
+    return $range
+  }
+  function Insert-Block($doc, $para, $value) {
+    $written = ([string]$value) -replace "`n", "`r"
+    if ($written -notmatch "`r$") { $written += "`r" }
+    if (-not $para) {
+      $range = $doc.Content.Duplicate
+      $range.Collapse(1)
+      $range.InsertBefore($written)
+      return $range
+    }
+    $range = $para.Range.Duplicate
+    $range.Collapse(0)
+    $range.InsertBefore($written)
+    return $range
+  }
+  function Replace-Body($para, $old, $new, $all) {
+    $probe = $para.Range.Duplicate
+    try { $null = $probe.MoveEnd(1, -1) } catch {}
     $text = ""
-    try { $text = [string]$chosen.Content.Text } catch { Write-Result @{ status = "noapp" }; exit 0 }
-    $text = $text -replace "`r", "`n"
-    if ($text.Length -gt 8000) { $text = $text.Substring(0, 8000) }
-    Write-Result @{ status = "text"; text = $text }
+    try { $text = [string]$probe.Text } catch { return 0 }
+    if (-not $old) { return 0 }
+    $spots = @()
+    $from = 0
+    while ($true) {
+      $at = $text.IndexOf($old, $from)
+      if ($at -lt 0) { break }
+      $spots += $at
+      if (-not $all) { break }
+      $from = $at + $old.Length
+    }
+    for ($s = $spots.Count - 1; $s -ge 0; $s--) {
+      $hit = $probe.Duplicate
+      $hit.Start = $probe.Start + [int]$spots[$s]
+      $hit.End = $hit.Start + $old.Length
+      $hit.Text = [string]$new
+      if ($payload.format) { Apply-Format $hit $payload.format $para }
+    }
+    return $spots.Count
+  }
+  function Test-Prop($obj, $name) {
+    if (-not $obj) { return $false }
+    return @($obj.PSObject.Properties.Name) -contains $name
+  }
+  function Apply-Format($range, $fmt, $para) {
+    if (-not $fmt) { return }
+    if (-not $para) { try { $para = $range.Paragraphs.Item(1) } catch {} }
+    try {
+      $font = $range.Font
+      if (Test-Prop $fmt "bold") { $font.Bold = $(if ($fmt.bold) { 1 } else { 0 }) }
+      if (Test-Prop $fmt "italic") { $font.Italic = $(if ($fmt.italic) { 1 } else { 0 }) }
+      if (Test-Prop $fmt "underline") { $font.Underline = $(if ($fmt.underline) { 1 } else { 0 }) }
+      if (Test-Prop $fmt "strike") { $font.StrikeThrough = $(if ($fmt.strike) { 1 } else { 0 }) }
+      if (Test-Prop $fmt "font") {
+        $font.Name = [string]$fmt.font
+        try { $font.NameFarEast = [string]$fmt.font } catch {}
+        try { $font.NameAscii = [string]$fmt.font } catch {}
+      }
+      if (Test-Prop $fmt "size") { $font.Size = [double]$fmt.size }
+      if (Test-Prop $fmt "color") {
+        $hex = ([string]$fmt.color).TrimStart("#")
+        if ($hex.Length -eq 6) {
+          $r = [Convert]::ToInt32($hex.Substring(0, 2), 16)
+          $g = [Convert]::ToInt32($hex.Substring(2, 2), 16)
+          $b = [Convert]::ToInt32($hex.Substring(4, 2), 16)
+          $font.Color = $r + ($g * 256) + ($b * 65536)
+        }
+      }
+      if (Test-Prop $fmt "highlight") {
+        $map = @{ yellow = 7; green = 11; red = 6; blue = 2; cyan = 3; magenta = 5; lightGray = 16 }
+        $mark = [string]$fmt.highlight
+        $font.HighlightColorIndex = $(if ($map.ContainsKey($mark)) { $map[$mark] } else { 0 })
+      }
+    } catch {}
+    if (-not $para) { return }
+    try {
+      if (Test-Prop $fmt "align") {
+        $align = @{ left = 0; center = 1; right = 2; both = 3 }[[string]$fmt.align]
+        if ($null -ne $align) { $para.Alignment = $align }
+      }
+    } catch {}
+    if (Test-Prop $fmt "style") {
+      $names = switch ([string]$fmt.style) {
+        "Heading1" { @("Heading 1", "标题 1", "标题1") }
+        "Heading2" { @("Heading 2", "标题 2", "标题2") }
+        "Heading3" { @("Heading 3", "标题 3", "标题3") }
+        "Heading4" { @("Heading 4", "标题 4", "标题4") }
+        "Title" { @("Title", "标题") }
+        "Normal" { @("Normal", "正文") }
+        default { @([string]$fmt.style) }
+      }
+      foreach ($name in $names) {
+        try { $para.Style = $name; break } catch {}
+      }
+    }
+  }
+  function Describe-Paragraph($para) {
+    $body = (Get-ParagraphBody $para).Trim()
+    $marks = New-Object System.Collections.Generic.List[string]
+    try {
+      $style = [string]$para.Style.NameLocal
+      if ($style -and $style -notin @("正文", "Normal", "正文文本")) { $marks.Add($style) }
+    } catch {}
+    try {
+      $align = [int]$para.Alignment
+      if ($align -eq 1) { $marks.Add("居中") }
+      elseif ($align -eq 2) { $marks.Add("右对齐") }
+      elseif ($align -eq 3) { $marks.Add("两端对齐") }
+    } catch {}
+    $range = $para.Range.Duplicate
+    try { $null = $range.MoveEnd(1, -1) } catch {}
+    try {
+      $font = $range.Font
+      $bold = [int]$font.Bold
+      if ($bold -eq 1 -or $bold -eq -1) { $marks.Add("加粗") }
+      $italic = [int]$font.Italic
+      if ($italic -eq 1 -or $italic -eq -1) { $marks.Add("斜体") }
+      if ([int]$font.Underline -gt 0 -and [int]$font.Underline -lt 9999999) { $marks.Add("下划线") }
+      $strike = [int]$font.StrikeThrough
+      if ($strike -eq 1 -or $strike -eq -1) { $marks.Add("删除线") }
+      $name = ""
+      try { $name = [string]$font.NameFarEast } catch {}
+      if (-not $name) { try { $name = [string]$font.Name } catch {} }
+      if ($name -and $name -ne "9999999") { $marks.Add($name) }
+      $size = 0.0
+      try { $size = [double]$font.Size } catch {}
+      if ($size -gt 0 -and $size -lt 200) {
+        if ($size -eq [math]::Floor($size)) { $marks.Add(("{0}磅" -f [int]$size)) } else { $marks.Add(("{0}磅" -f $size)) }
+      }
+      $color = -1
+      try { $color = [int]$font.Color } catch {}
+      if ($color -gt 0 -and $color -lt 16777216) {
+        $r = $color -band 255
+        $g = ($color -shr 8) -band 255
+        $b = ($color -shr 16) -band 255
+        $marks.Add(("#{0:X2}{1:X2}{2:X2}" -f $r, $g, $b))
+      }
+      $hi = 0
+      try { $hi = [int]$font.HighlightColorIndex } catch {}
+      if ($hi -gt 0 -and $hi -lt 100) { $marks.Add("高亮") }
+    } catch {}
+    if ($marks.Count -eq 0) { return $body }
+    return ("[" + ($marks -join " ") + "] " + $body)
+  }
+  function Format-Paragraph($para, $oldText, $fmt) {
+    if (-not $oldText) {
+      $range = $para.Range.Duplicate
+      try { $null = $range.MoveEnd(1, -1) } catch {}
+      Apply-Format $range $fmt $para
+      return 1
+    }
+    $probe = $para.Range.Duplicate
+    try { $null = $probe.MoveEnd(1, -1) } catch {}
+    $text = ""
+    try { $text = [string]$probe.Text } catch { return 0 }
+    $spots = @()
+    $from = 0
+    while ($true) {
+      $at = $text.IndexOf($oldText, $from)
+      if ($at -lt 0) { break }
+      $spots += $at
+      $from = $at + $oldText.Length
+    }
+    for ($s = $spots.Count - 1; $s -ge 0; $s--) {
+      $hit = $probe.Duplicate
+      $hit.Start = $probe.Start + [int]$spots[$s]
+      $hit.End = $hit.Start + $oldText.Length
+      Apply-Format $hit $fmt $para
+    }
+    return $spots.Count
+  }
+  $newText = [string]$payload.new
+  $oldText = [string]$payload.old
+  if ($action -eq "read") {
+    $limit = 120
+    try { $limit = [int]$payload.limit } catch {}
+    if ($limit -lt 1) { $limit = 120 }
+    if ($limit -gt 400) { $limit = 400 }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $seen = 0
+    foreach ($para in (Get-Numbered $chosen)) {
+      $seen++
+      if ($seen -le $limit) {
+        $lines.Add("$seen. " + (Describe-Paragraph $para))
+      }
+    }
+    $suffix = ""
+    if ($seen -gt $lines.Count) { $suffix = "`n（只列出了前 $($lines.Count) 段，共 $seen 段）" }
+    elseif ($seen -gt 0) { $suffix = "`n（共 $seen 段）" }
+    Write-Result @{ status = "text"; text = (($lines -join "`n") + $suffix); total = $seen }
     exit 0
   }
-  if ($action -eq "paragraph") {
+  if ($action -eq "paragraph" -or $action -eq "insert" -or $action -eq "delete") {
     $want = 0
-    try { $want = [int]$payload.index } catch { Write-Result @{ status = "nomatch" }; exit 0 }
-    $expect = ([string]$payload.old).Trim()
-    $seen = 0
-    foreach ($para in @($chosen.Paragraphs)) {
-      $raw = ""
-      try { $raw = [string]$para.Range.Text } catch { continue }
-      $text = ($raw -replace "[`r`n`a]+$", "").Trim()
-      if (-not $text) { continue }
-      $seen++
-      if ($seen -ne $want) { continue }
-      if ($expect -and $text -ne $expect) { Write-Result @{ status = "nomatch" }; exit 0 }
-      $range = $para.Range.Duplicate
-      $null = $range.MoveEnd(1, -1)
-      $range.Text = [string]$payload.new
-      try { $chosen.Save() } catch {}
-      Write-Result @{ status = "replaced" }
+    try { $want = [int]$payload.index } catch { $want = 0 }
+    $numbered = @(Get-Numbered $chosen)
+    if ($action -eq "insert" -and $want -le 0) {
+      if ($want -eq 0 -and $null -ne $payload.index) {
+        $range = Insert-Block $chosen $null $newText
+      } else {
+        $anchor = $null
+        if ($numbered.Count -gt 0) { $anchor = $numbered[$numbered.Count - 1] }
+        $range = Insert-Block $chosen $anchor $newText
+      }
+      if ($payload.format) { Apply-Format $range $payload.format $null }
+      Save-Doc $chosen
+      Write-Result @{ status = "replaced"; count = 1 }
       exit 0
     }
-    Write-Result @{ status = "nomatch" }
+    if ($want -lt 1 -or $want -gt $numbered.Count) {
+      Write-Result @{ status = "badindex"; count = $numbered.Count }
+      exit 0
+    }
+    $targetPara = $numbered[$want - 1]
+    if ($action -eq "delete") {
+      try { $null = $targetPara.Range.Delete() } catch { Write-Result @{ status = "error"; message = [string]$_.Exception.Message }; exit 1 }
+      Save-Doc $chosen
+      Write-Result @{ status = "replaced"; count = 1 }
+      exit 0
+    }
+    if ($action -eq "insert") {
+      $range = Insert-Block $chosen $targetPara $newText
+      if ($payload.format) { Apply-Format $range $payload.format $null }
+      Save-Doc $chosen
+      Write-Result @{ status = "replaced"; count = 1 }
+      exit 0
+    }
+    if ($oldText) {
+      $body = Get-ParagraphBody $targetPara
+      $hits = 0
+      $from = 0
+      while ($true) {
+        $at = $body.IndexOf($oldText, $from)
+        if ($at -lt 0) { break }
+        $hits++
+        $from = $at + $oldText.Length
+      }
+      if (-not $hits) { Write-Result @{ status = "nomatch" }; exit 0 }
+      if ($hits -gt 1) { Write-Result @{ status = "ambiguous"; count = $hits }; exit 0 }
+      $null = Replace-Body $targetPara $oldText $newText $false
+      Save-Doc $chosen
+      Write-Result @{ status = "replaced"; count = 1 }
+      exit 0
+    }
+    $range = Set-BodyText $targetPara $newText
+    if ($payload.format) { Apply-Format $range $payload.format $targetPara }
+    Save-Doc $chosen
+    Write-Result @{ status = "replaced"; count = 1 }
     exit 0
   }
-  $old = [string]$payload.old
-  $new = [string]$payload.new
-  $find = $chosen.Content.Find
-  $find.ClearFormatting()
-  $find.Replacement.ClearFormatting()
-  $find.Text = $old
-  $find.Replacement.Text = $new
-  $find.Forward = $true
-  $find.Wrap = 1
-  $find.Format = $false
-  $find.MatchCase = $false
-  $ok = $find.Execute($old, [bool]$false, [bool]$false, [bool]$false, [bool]$false, [bool]$false, [bool]$true, [int]1, [bool]$false, $new, [int]1)
-  if ($ok) {
-    try { $chosen.Save() } catch {}
-    Write-Result @{ status = "replaced" }
-  } else { Write-Result @{ status = "nomatch" } }
+  if ($action -eq "format") {
+    if (-not $payload.format) { Write-Result @{ status = "nomatch" }; exit 0 }
+    $want = $null
+    if ($null -ne $payload.index -and "$($payload.index)" -ne "") {
+      try { $want = [int]$payload.index } catch { $want = $null }
+    }
+    $numbered = @(Get-Numbered $chosen)
+    if ($null -ne $want) {
+      if ($want -lt 1 -or $want -gt $numbered.Count) {
+        Write-Result @{ status = "badindex"; count = $numbered.Count }
+        exit 0
+      }
+      $hits = Format-Paragraph $numbered[$want - 1] $oldText $payload.format
+      if (-not $hits) { Write-Result @{ status = "nomatch" }; exit 0 }
+      Save-Doc $chosen
+      Write-Result @{ status = "replaced"; count = $hits }
+      exit 0
+    }
+    if (-not $oldText) { Write-Result @{ status = "nomatch" }; exit 0 }
+    $total = 0
+    foreach ($para in $numbered) { $total += Format-Paragraph $para $oldText $payload.format }
+    if (-not $total) { Write-Result @{ status = "nomatch" }; exit 0 }
+    Save-Doc $chosen
+    Write-Result @{ status = "replaced"; count = $total }
+    exit 0
+  }
+  $replaceAll = $action -eq "replace_all"
+  if (-not $oldText) { Write-Result @{ status = "nomatch" }; exit 0 }
+  $totalHits = 0
+  $numbered = @(Get-Numbered $chosen)
+  foreach ($para in $numbered) {
+    $body = Get-ParagraphBody $para
+    $from = 0
+    while ($true) {
+      $at = $body.IndexOf($oldText, $from)
+      if ($at -lt 0) { break }
+      $totalHits++
+      $from = $at + $oldText.Length
+    }
+  }
+  if ($totalHits -eq 0) { Write-Result @{ status = "nomatch" }; exit 0 }
+  if ($totalHits -gt 1 -and -not $replaceAll) {
+    Write-Result @{ status = "ambiguous"; count = $totalHits }
+    exit 0
+  }
+  $written = 0
+  foreach ($para in $numbered) {
+    $written += Replace-Body $para $oldText $newText $replaceAll
+  }
+  if (-not $written) { Write-Result @{ status = "nomatch" }; exit 0 }
+  Save-Doc $chosen
+  Write-Result @{ status = "replaced"; count = $written }
 } catch {
   Write-Result @{ status = "error"; message = [string]$_.Exception.Message }
   exit 1
@@ -516,27 +802,46 @@ def active_document_path(filename):
     return None
 
 
-def read_open_document(path):
-    result = _office_call({"action": "read", "path": str(path), "old": "", "new": ""})
+def read_open_document(path, limit=120):
+    result = edit_open_document(path, "read", limit=limit)
     if result.get("status") != "text":
         return ""
     return str(result.get("text") or "").strip()
 
 
+def edit_open_document(path, action, old="", new="", index=None, limit=120, fmt=None):
+    """Edit or read the copy open in WPS or Word. Returns the raw status payload."""
+    payload = {
+        "action": action,
+        "path": str(path),
+        "old": "" if old is None else str(old),
+        "new": "" if new is None else str(new),
+        "limit": int(limit or 120),
+    }
+    if fmt:
+        payload["format"] = fmt
+    if index is not None and index != "":
+        payload["index"] = int(index)
+    result = _office_call(payload)
+    status = result.get("status")
+    if status in {"replaced", "nomatch", "ambiguous", "badindex", "error", "text", "path"}:
+        return result
+    return {"status": "noapp"}
+
+
 def replace_open_paragraph(path, index, old, new):
     """Replace one numbered paragraph in the document WPS or Word has open."""
-    result = _office_call({
-        "action": "paragraph", "path": str(path), "old": old, "new": new, "index": int(index),
-    })
+    action = "paragraph"
+    result = edit_open_document(path, action, old, new, index)
     status = result.get("status")
-    if status in ("replaced", "nomatch"):
+    if status in ("replaced", "nomatch", "ambiguous", "badindex"):
         return status
     return "noapp"
 
 
 def replace_open_document(path, old, new):
-    result = _office_call({"action": "replace", "path": str(path), "old": old, "new": new})
+    result = edit_open_document(path, "replace", old, new)
     status = result.get("status")
-    if status in ("replaced", "nomatch"):
+    if status in ("replaced", "nomatch", "ambiguous", "badindex"):
         return status
     return "noapp"

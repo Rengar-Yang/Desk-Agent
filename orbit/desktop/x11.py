@@ -259,6 +259,13 @@ def _prepare_xlib(lib):
     lib.XRaiseWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 
 
+def _xid(value):
+    """Window ids are hex strings ("0x1a2b"). Followers may already be ints."""
+    if isinstance(value, str):
+        return int(value.strip(), 16)
+    return int(value)
+
+
 def stack_with_window(owner, followers):
     """Place followers immediately above owner, lowest hwnd first."""
     lib = _xlib()
@@ -271,12 +278,12 @@ def stack_with_window(owner, followers):
     try:
         changes = _XWindowChanges()
         changes.stack_mode = 0  # Above
-        sibling = int(owner)
+        sibling = _xid(owner)
         mask = (1 << 5) | (1 << 6)  # CWSibling | CWStackMode
         for hwnd in followers:
             changes.sibling = sibling
-            lib.XConfigureWindow(display, int(hwnd), mask, ctypes.byref(changes))
-            sibling = int(hwnd)
+            lib.XConfigureWindow(display, _xid(hwnd), mask, ctypes.byref(changes))
+            sibling = _xid(hwnd)
         lib.XFlush(display)
     except (OSError, TypeError, ValueError):
         return
@@ -294,7 +301,7 @@ def float_above(hwnds):
         return
     try:
         for hwnd in hwnds:
-            lib.XRaiseWindow(display, int(hwnd))
+            lib.XRaiseWindow(display, _xid(hwnd))
         lib.XFlush(display)
     except (OSError, TypeError, ValueError):
         return

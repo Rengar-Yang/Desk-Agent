@@ -945,8 +945,15 @@ _HWND_NOTOPMOST = -2
 _GW_HWNDPREV = 3
 
 
+def _parse_hwnd(value):
+    """Window ids are hex strings ("0x1a2b"). Followers may already be ints."""
+    if isinstance(value, str):
+        return int(value.strip(), 16)
+    return int(value)
+
+
 def _as_hwnd(value):
-    return wintypes.HWND(int(value))
+    return wintypes.HWND(_parse_hwnd(value))
 
 
 def _is_topmost(hwnd):
@@ -997,7 +1004,7 @@ def stack_with_window(owner, followers):
     followers is bottom-to-top: the first handle sits closest to the owner.
     """
     try:
-        owner = int(owner)
+        owner = _parse_hwnd(owner)
     except (TypeError, ValueError):
         return
     if not owner or not user32().IsWindow(_as_hwnd(owner)):
@@ -1005,7 +1012,7 @@ def stack_with_window(owner, followers):
     group = []
     for hwnd in followers:
         try:
-            number = int(hwnd)
+            number = _parse_hwnd(hwnd)
         except (TypeError, ValueError):
             continue
         if number and number != owner and user32().IsWindow(_as_hwnd(number)):
@@ -1031,7 +1038,7 @@ def float_above(hwnds):
     ordered = []
     for hwnd in hwnds:
         try:
-            number = int(hwnd)
+            number = _parse_hwnd(hwnd)
         except (TypeError, ValueError):
             continue
         if number and user32().IsWindow(_as_hwnd(number)):
@@ -1042,7 +1049,10 @@ def float_above(hwnds):
 
 def focus_window(hwnd):
     """Raise a normal window above other apps. The caller then stacks Orbit just above it."""
-    handle = wintypes.HWND(int(hwnd))
+    try:
+        handle = _as_hwnd(hwnd)
+    except (TypeError, ValueError):
+        return
     if not user32().IsWindow(handle):
         return
     user32().ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]

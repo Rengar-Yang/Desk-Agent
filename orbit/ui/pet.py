@@ -1527,7 +1527,8 @@ class Pet(QWidget):
             sent = message + "\n请立刻调用 edit_document 完成上一步说的修改。不要只用文字说已经改好，不要使用 shell。"
         context = (
             "你是 Orbit 桌面助手，用中文回复。需要查看或修改文件时调用工具，不要假装已经读过或改过。"
-            "吸附的是 WPS 或 Word 时，只用 read_document 和 edit_document 修改 .docx。用户要求改文档时立刻调用 edit_document，传 paragraph 和 new，直接写入，不要询问是否执行。"
+            "吸附的是 WPS 或 Word 时，只用 read_document 和 edit_document 修改 .docx。用户要求改文档时立刻调用 edit_document 并直接写入，不要询问是否执行。"
+            "改整段传 paragraph 和 new；只改其中几个字再加 old；插入用 mode=insert；删除用 mode=delete；全部替换用 mode=replace_all；改加粗、字体、字号、颜色、对齐或标题用 mode=format 和 format。"
             "没有工具返回已写入或已改好之前，禁止说已经改好、已替换、已写入或命令已执行。不要用 shell、python 或 document.xml。"
             "不要让用户自己在 WPS 里改，也不要让用户关闭文档。运行命令仍会请用户确认。敏感文件会读取失败。浏览器没有正文时，用 fetch_url 读取 http 或 https 地址。\n"
             + context_prompt(self.target, self.working_directory())

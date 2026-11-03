@@ -13,13 +13,11 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from orbit.config import get_config, shell_timeout_seconds
-from orbit.desktop.docx import count_docx, paragraph_text, read_docx_paragraphs, rewrite_docx, rewrite_paragraph
+from orbit.desktop.docx import edit_docx, normalize_format, read_docx_paragraphs
 from orbit.desktop.files import (
     SKIP_DIRS, clip_text, list_directory, looks_secret, read_file_text, scoped_path, search_files,
 )
-from orbit.desktop.office import (
-    open_document_path, read_open_document, replace_open_document, replace_open_paragraph,
-)
+from orbit.desktop.office import edit_open_document, open_document_path, read_open_document
 
 API_TOOLS = [
     {"type": "function", "function": {
@@ -65,21 +63,23 @@ API_TOOLS = [
     }},
     {"type": "function", "function": {
         "name": "read_document",
-        "description": "读取吸附的 WPS/Word .docx 正文。path 可省略，默认就是当前文档。",
+        "description": "读取吸附的 WPS/Word .docx。返回带序号的段落，优先读正在打开的那一份。path 可省略。",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "文档路径，可省略"},
-            "limit": {"type": "integer", "description": "最多返回多少段，默认 80"},
+            "limit": {"type": "integer", "description": "最多返回多少段，默认 120，最大 400"},
         }},
     }},
     {"type": "function", "function": {
         "name": "edit_document",
-        "description": "直接修改 .docx，调用后立即写入，不要先询问用户。给 paragraph 和 new 替换第几段，或给 old 和 new 替换只出现一次的原文。文档正打开时改 WPS/Word 里的那一份并保存。不要用 shell 或 python。",
+        "description": "直接修改 .docx 的文字和格式，调用后立即写入，不要先询问。mode 默认 replace：paragraph+new 替换整段；再加 old 只改几个字；只有 old+new 时原文必须只出现一次。mode=replace_all 全部替换。mode=insert 插入，paragraph 是插在第几段后，0 是文首，省略是文末。mode=delete 删除段落。mode=format 只改格式不改文字。format 可含 bold、italic、underline、strike、font、size（磅或小四）、color（FF0000 或红）、highlight（yellow/green/red/none）、align（left/center/right/justify）、style（normal/title/heading1/heading2/heading3）。替换或插入时 format 套在新文字上。文档正打开时改 WPS/Word 里的那一份并保存。不要用 shell 或 python。",
         "parameters": {"type": "object", "properties": {
             "path": {"type": "string", "description": "文档路径，可省略，默认当前吸附的文档"},
-            "old": {"type": "string", "description": "要替换的原文，必须只出现一次。与 paragraph 二选一"},
-            "paragraph": {"type": "integer", "description": "要整段替换的段落号，从 1 开始，与 read_document 的序号一致"},
-            "new": {"type": "string", "description": "替换后的文字"},
-        }, "required": ["new"]},
+            "mode": {"type": "string", "description": "replace、replace_all、insert、delete、format，默认 replace"},
+            "paragraph": {"type": "integer", "description": "段落号，从 1 开始，与 read_document 一致。insert 时 0 表示文首，省略表示文末"},
+            "old": {"type": "string", "description": "要替换或套格式的原文，不要带段落序号"},
+            "new": {"type": "string", "description": "替换或插入的文字。delete 和 format 时不用填"},
+            "format": {"type": "object", "description": "格式。bold/italic/underline/strike、font、size、color、highlight、align、style"},
+        }},
     }},
     {"type": "function", "function": {
         "name": "shell",
@@ -183,8 +183,8 @@ def run_shell_command(command, root):
     if _WORD_SCRIPT.search(command or ""):
         return (
             "没有执行这条命令。用 python 或压缩包脚本改 Word 时，经常是退出码 0 且没有任何输出，"
-            "这不能说明文档已修改。请改用 read_document 看段落，再用 edit_document："
-            "传 old 和 new，或传 paragraph（第几段，从 1 开始）和 new。"
+            "这不能说明文档已修改。请改用 read_document 看段落序号，再用 edit_document。"
+            "改整段传 paragraph 和 new；只改几个字再加 old；插入用 mode=insert；删除用 mode=delete；全部替换用 mode=replace_all；改格式用 mode=format。"
         )
     if _python_stub(command):
         return (
@@ -251,7 +251,7 @@ def _replace_failure(old, count):
     if count == 0:
         shown = f"原文开头是「{head}」。" if head else ""
         return "没有找到这段原文，所以没有改文件。" + shown + "请按文件里现在的内容，重新给一段完整且只出现一次的原文。"
-    return f"这段原文出现了 {count} 次，没法确定改哪一处。请多带上前后几行，让它只出现一次。"
+    return f"这段原文出现了 {count} 次，没法确定改哪一处。请多带上前后几个字，或改用 mode=replace_all 全部替换。"
 
 
 def _document_file(args, root, attached):
@@ -262,127 +262,244 @@ def _read_document(args, root, attached):
     path = _document_file(args, root, attached)
     if path.suffix.lower() not in {".docx", ".docm"}:
         return "目前只能直接读取 .docx 的正文。文件在：" + str(path)
-    limit = args.get("limit") or 80
-    try:
-        limit = max(1, min(200, int(limit)))
-    except (TypeError, ValueError):
-        limit = 80
-    text = ""
+    limit = _paragraph_limit(args.get("limit"))
+    live = read_open_document(path, limit)
+    if live:
+        return clip_text(f"{path}\n{live}\n（这是正在打开的 WPS/Word）\n{_DOC_HINT}", 20000)
     try:
         text = read_docx_paragraphs(path, limit)
     except OSError:
         text = ""
-    except Exception:
+    except (KeyError, ValueError, SyntaxError):
         return "这个文件不是有效的 docx。"
+    except Exception as error:
+        name = type(error).__name__
+        if name in {"BadZipFile", "ParseError"}:
+            return "这个文件不是有效的 docx。"
+        return "读取失败：" + str(error)
     if text:
-        return clip_text(str(path) + "\n" + text)
-    live = read_open_document(path)
-    if live:
-        return clip_text(str(path) + "\n" + live + "\n（来自正在打开的 WPS/Word）")
+        return clip_text(f"{path}\n{text}\n{_DOC_HINT}", 20000)
     return "没能读到这份文档的正文。请确认它是 .docx，并且 WPS 里正打开这一份。"
 
 
-def _edit_paragraph(path, index, new, confirm, undo):
-    current = None
-    locked = False
+def _paragraph_limit(value):
     try:
-        current = paragraph_text(path, index)
+        return max(1, min(400, int(value or 120)))
+    except (TypeError, ValueError):
+        return 120
+
+
+_DOC_HINT = (
+    "改整段：paragraph + new。只改段内几个字：再加上 old。"
+    "在第 N 段后插入：mode=insert、paragraph=N（0 是文首，省略是文末）。"
+    "删段：mode=delete。全部替换：mode=replace_all。"
+    "只改格式：mode=format，并用 format 指定 bold、font、size、color、highlight、align、style。"
+    "方括号里是当前格式，不是正文。换行写成 \\n。"
+)
+
+
+def _edit_mode(args):
+    mode = str(args.get("mode") or "replace").strip().lower()
+    return {
+        "append": "insert", "add": "insert", "remove": "delete", "all": "replace_all",
+        "format": "format", "格式": "format",
+    }.get(mode, mode)
+
+
+def _edit_index(args):
+    paragraph = args.get("paragraph")
+    if paragraph in (None, ""):
+        return None
+    return int(paragraph)
+
+
+def _arm_undo(undo, path):
+    if not undo:
+        return False
+    try:
+        return undo(path) == "ok"
     except OSError:
-        current = None
-        locked = True
-    except Exception:
-        return "这个文件不是有效的 docx。"
-    if not locked and not current:
+        return False
+
+
+def _drop_undo(undo, armed):
+    if not armed:
+        return
+    owner = getattr(undo, "__self__", None)
+    discard = getattr(owner, "discard", None)
+    if discard:
+        discard()
+
+
+def _collect_format(args):
+    raw = {}
+    nested = args.get("format")
+    if isinstance(nested, dict):
+        raw.update(nested)
+    for key in (
+        "bold", "italic", "underline", "strike", "font", "size", "color", "highlight", "align", "style",
+        "加粗", "斜体", "下划线", "删除线", "字体", "字号", "颜色", "高亮", "对齐", "样式",
+    ):
+        if key in args and args.get(key) not in (None, ""):
+            raw.setdefault(key, args.get(key))
+    return normalize_format(raw)
+
+
+def _with_format_note(message, fmt, mode):
+    if not fmt or mode == "format" or message.endswith("已套用格式。"):
+        return message
+    if message.endswith("。"):
+        return message[:-1] + "，已套用格式。"
+    return message + "已套用格式。"
+
+
+def _live_action(mode, index):
+    if mode in {"insert", "delete", "replace_all", "format"}:
+        return mode
+    if index is not None:
+        return "paragraph"
+    return "replace"
+
+
+def _where(index):
+    if index is None:
+        return "文末"
+    if index == 0:
+        return "文首"
+    return f"第 {index} 段后面"
+
+
+def _live_success(path, mode, index, result):
+    count = result.get("count") or 1
+    if mode == "format":
+        target = f"第 {index} 段" if index else "匹配的文字"
+        return f"已直接改好：已为{target}套用格式。正在打开的文档是 {path}。"
+    if mode == "delete":
+        return f"已直接改好：已删除第 {index} 段。正在打开的文档是 {path}。"
+    if mode == "insert":
+        return f"已直接改好：已在{_where(index)}插入文字。正在打开的文档是 {path}。"
+    if mode == "replace_all":
+        return f"已直接改好正在打开的文档：{path}。替换了 {count} 处。"
+    if index:
+        return f"已直接改好第 {index} 段，正在打开的文档是 {path}。"
+    return f"已直接改好正在打开的文档：{path}。"
+
+
+def _disk_success(path, mode, index, count):
+    tail = "如果 WPS 还显示旧内容，关掉后重新打开即可看到修改。"
+    if mode == "format":
+        target = f"第 {index} 段" if index else "匹配的文字"
+        return f"已写入，已为{target}套用格式：{path}。{tail}"
+    if mode == "delete":
+        return f"已写入，已删除第 {index} 段：{path}。{tail}"
+    if mode == "insert":
+        return f"已写入新段落到{_where(index)}：{path}。{tail}"
+    if mode == "replace_all":
+        return f"已写入 {path}。替换了 {count} 处。{tail}"
+    if index:
+        return f"已写入第 {index} 段：{path}。{tail}"
+    return f"已写入 {path}。{tail}"
+
+
+def _live_failure(status, result, index):
+    if status == "badindex":
+        total = result.get("count")
+        if total:
+            return f"没有第 {index} 段。这份文档共 {total} 段。请先用 read_document 看序号。"
         return f"没有第 {index} 段。请先用 read_document 看序号。"
-    if current:
-        live = replace_open_paragraph(path, index, current, new)
-        if live == "nomatch":
-            # The open document can differ from the file on disk after the previous edit.
-            live = replace_open_paragraph(path, index, "", new)
-    else:
-        live = replace_open_paragraph(path, index, "", new)
-    if not current and live != "replaced":
-        return "文件正被 WPS 占用，读不到段落序号。请改用 old 和 new，按文档里的原文替换。"
-    if live == "replaced":
-        return f"已改好第 {index} 段，正在打开的文档是 {path}。已写入 WPS 正在显示的内容。"
-    if live != "noapp":
-        count = None
-        try:
-            count = count_docx(path, current)
-        except OSError:
-            count = None
-        if count == 1:
-            live = replace_open_document(path, current, new)
-            if live == "replaced":
-                return f"已改好第 {index} 段，正在打开的文档是 {path}。已写入 WPS 正在显示的内容。"
-    try:
-        if undo:
-            undo(path)
-        written = rewrite_paragraph(path, index, new)
-    except PermissionError:
-        return "文档正被 WPS 占用，这次没改到打开的内容。请保持该文档打开后再改一次。"
-    except OSError as error:
-        return "写入失败：" + str(error)
-    except Exception as error:
-        return "写入失败：" + str(error)
-    if written != 1:
-        return f"没有写进第 {index} 段。"
-    return f"已写入第 {index} 段：{path}。如果 WPS 还显示旧内容，关掉后重新打开即可看到修改。"
+    if status == "ambiguous":
+        count = result.get("count") or 0
+        place = f"第 {index} 段里" if index else "文档里"
+        return f"{place}这段原文出现了 {count} 次，没有写入。请把 old 写得更完整，或改用 mode=replace_all。"
+    if status == "nomatch":
+        return "打开的文档里没有这段原文，没有写入。请按屏幕上现在的文字重新给 old。"
+    if status == "error":
+        return "WPS/Word 没有完成修改：" + str(result.get("message") or "未知错误")
+    return None
+
+
+def _disk_failure(code, info, index, old):
+    if code == "badindex":
+        total = info if isinstance(info, int) else 0
+        if total:
+            return f"没有第 {index} 段。这份文档共 {total} 段。请先用 read_document 看序号。"
+        return f"没有第 {index} 段。请先用 read_document 看序号。"
+    if code == "ambiguous":
+        place = f"第 {index} 段里" if index else "文档里"
+        return f"{place}这段原文出现了 {info} 次，没有写入。请把 old 写得更完整，或改用 mode=replace_all。"
+    if code == "missing":
+        return _replace_failure(old, 0) if old else "没有写进文档。"
+    return "没有写进文档。"
 
 
 def _edit_document(args, root, confirm, undo, attached):
     import zipfile
+    from xml.etree.ElementTree import ParseError
 
     path = _document_file(args, root, attached)
     if path.suffix.lower() not in {".docx", ".docm"}:
         return "目前只能直接修改 .docx。请在 WPS 里另存为 .docx 后再改。文件在：" + str(path)
+    mode = _edit_mode(args)
+    if mode not in {"replace", "replace_all", "insert", "delete", "format"}:
+        return "mode 只能是 replace、replace_all、insert、delete 或 format。"
+    try:
+        index = _edit_index(args)
+    except (TypeError, ValueError):
+        return "paragraph 必须是整数。段落从 1 开始，插入时 0 表示文首。"
     new = str(args.get("new") if args.get("new") is not None else "")
-    if len(new) > 20_000:
-        return "替换内容过长。"
-    paragraph = args.get("paragraph")
-    if paragraph not in (None, ""):
-        try:
-            index = int(paragraph)
-        except (TypeError, ValueError):
-            return "paragraph 必须是从 1 开始的整数。"
-        return _edit_paragraph(path, index, new, confirm, undo)
     old = str(args.get("old") if args.get("old") is not None else "")
-    new = str(args.get("new") if args.get("new") is not None else "")
-    if not old:
-        return "没有给出要替换的原文。"
     if len(old) > 20_000 or len(new) > 20_000:
         return "替换内容过长。"
-    count = None
+    fmt = _collect_format(args)
+    if fmt and not new and mode in {"replace", "replace_all"}:
+        mode = "format"
+    if mode == "delete":
+        if index is None or index < 1:
+            return "删除时要给出 paragraph，也就是要删的段落号。"
+    elif mode == "insert":
+        if not new:
+            return "插入时要给出 new，也就是新段落的文字。"
+        if index is not None and index < 0:
+            return "paragraph 不能是负数。0 表示插到文首。"
+    elif mode == "replace_all":
+        if not old:
+            return "全部替换时要给出 old 和 new。"
+    elif mode == "format":
+        if not fmt:
+            return "套用格式时要给出 format，例如加粗、字体、字号、颜色、对齐或标题样式。"
+        if (index is None or index < 1) and not old:
+            return "套用格式时要给出 paragraph，或给出 old 指明哪几个字。"
+    else:
+        if index is None and not old:
+            return "没有给出要改的内容。可以传 paragraph 和 new 替换整段，或传 old 和 new 替换原文。"
+        if index is not None and index < 1:
+            return "paragraph 必须是从 1 开始的整数。"
+    armed = _arm_undo(undo, path)
+    live_index = index
+    if mode == "insert" and index is None:
+        live_index = None
+    live = edit_open_document(path, _live_action(mode, index), old, new, live_index, fmt=fmt)
+    status = live.get("status")
+    if status == "replaced":
+        return _with_format_note(_live_success(path, mode, index, live), fmt, mode)
+    if status in {"nomatch", "ambiguous", "badindex", "error"}:
+        _drop_undo(undo, armed)
+        return _live_failure(status, live, index)
     try:
-        count = count_docx(path, old)
-    except OSError:
-        count = None
-    except (KeyError, zipfile.BadZipFile, SyntaxError, ValueError):
-        return "这个文件不是有效的 docx。"
-    if count == 0:
-        return _replace_failure(old, 0)
-    if count is not None and count > 1:
-        return _replace_failure(old, count)
-    live = replace_open_document(path, old, new)
-    if live == "replaced":
-        return "已直接改好正在打开的文档：" + str(path) + "。WPS 里可以撤销，需要的话再保存。"
-    if live == "nomatch":
-        if count:
-            return "磁盘上的文件有这段原文，但正在打开的文档里没有。为避免盖掉未保存的内容，没有写入。请按屏幕上的文字重新给原文。"
-        return "打开的文档里没有这段原文，没有写入。"
-    try:
-        if undo:
-            undo(path)
-        written = rewrite_docx(path, old, new)
+        code, info = edit_docx(path, mode, paragraph=index, old=old, new=new, fmt=fmt)
     except PermissionError:
+        _drop_undo(undo, armed)
         return "文档正被 WPS 占用，这次没改到打开的内容。请保持该文档打开后再改一次。"
-    except (KeyError, zipfile.BadZipFile, SyntaxError):
+    except (KeyError, zipfile.BadZipFile, SyntaxError, ParseError, ValueError):
+        _drop_undo(undo, armed)
         return "这个文件不是有效的 docx。"
     except OSError as error:
+        _drop_undo(undo, armed)
         return "写入失败：" + str(error)
-    if written != 1:
-        return _replace_failure(old, written)
-    return "已写入 " + str(path) + "。如果 WPS 还显示旧内容，关掉后重新打开即可看到修改。"
+    if code != "ok":
+        _drop_undo(undo, armed)
+        return _disk_failure(code, info, index, old)
+    return _with_format_note(_disk_success(path, mode, index, info), fmt, mode)
 
 
 def run_tool(name, args, root, confirm, undo=None, document=None):
@@ -464,4 +581,13 @@ def tool_label(name, args):
         "read_document": "读取文档", "edit_document": "修改文档",
     }
     text = names.get(name, name)
+    if name == "edit_document":
+        mode = str(args.get("mode") or "replace")
+        paragraph = args.get("paragraph")
+        detail = {
+            "replace": "替换", "replace_all": "全部替换", "insert": "插入", "delete": "删除", "format": "改格式",
+        }.get(mode, mode)
+        if paragraph not in (None, ""):
+            detail += f" 第{paragraph}段"
+        return text + " · " + detail
     return text + ((" · " + str(target)[:80]) if target else "")

@@ -383,7 +383,8 @@ def context_prompt(window, cwd):
         if cwd and os.path.normpath(cwd) != os.path.normpath(target):
             lines.append(f"可写目录：{cwd}")
         if window.get("kind") == "document":
-            lines.append("目标就是这份文档。用 read_document 读取正文，用 edit_document 直接修改 .docx。")
+            lines.append("目标就是这份文档。用 read_document 读取带序号的正文，用 edit_document 直接修改 .docx。")
+            lines.append("改整段传 paragraph 和 new；只改段内几个字再加 old；在某一段后面插入用 mode=insert；删段用 mode=delete；同一句话全部替换用 mode=replace_all；改加粗、字体、字号、颜色、对齐或标题用 mode=format 和 format。")
             lines.append("用户要求修改时立刻调用 edit_document 并直接写入，不要询问是否执行，也不要让用户自己去改。")
             lines.append("没有 edit_document 返回已写入或已改好之前，禁止说已经改好、已替换或命令已执行。")
             lines.append("不要要求用户另存为 txt，不要说没有权限，也不要改去别的目录。")
@@ -403,7 +404,7 @@ def context_prompt(window, cwd):
     preview = window.get("preview")
     if preview:
         if window.get("kind") == "document":
-            lines.append("下面是文档段落。行首序号不是正文，edit_document 的 old 不要带序号。")
+            lines.append("下面是文档段落。行首序号和方括号里的格式说明都不是正文，edit_document 的 old 不要带上它们。换行会在 new 里写成 \\n。")
         lines.append("文本内容开头：\n" + preview[:get_config().context.preview_chars])
     elif window.get("kind") == "browser" and not window.get("url"):
         lines.append("浏览器没有暴露页面正文。若已知地址，请用工具抓取页面，不要只根据标题编造正文。")

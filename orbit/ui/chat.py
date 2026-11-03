@@ -199,6 +199,12 @@ class ChatWindow(QWidget):
         self.area.setFrameShape(QScrollArea.NoFrame)
         self.area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.area.verticalScrollBar().setSingleStep(28)
+        self._stick = False
+        self._pending_tail = False
+        self._tail_timer = QTimer(self)
+        self._tail_timer.setSingleShot(True)
+        self._tail_timer.timeout.connect(self._release_tail)
+        self.area.verticalScrollBar().rangeChanged.connect(self._follow_tail)
         self.messages = QWidget()
         self.message_layout = QVBoxLayout(self.messages)
         self.message_layout.setContentsMargins(2, 3, 2, 3)
@@ -476,7 +482,7 @@ class ChatWindow(QWidget):
         if author != "你":
             layout.addStretch()
         self.message_layout.insertWidget(self.message_layout.count() - 1, row)
-        QTimer.singleShot(0, lambda: self.area.verticalScrollBar().setValue(self.area.verticalScrollBar().maximum()))
+        self._stick_to_bottom()
         if not self._suspend_changed:
             self.changed.emit()
         self._refresh_retry()
@@ -519,7 +525,7 @@ class ChatWindow(QWidget):
             self.streaming = True
         self.current_bubble.raw_text += text
         self.current_bubble.refresh()
-        QTimer.singleShot(0, lambda: self.area.verticalScrollBar().setValue(self.area.verticalScrollBar().maximum()))
+        self._stick_to_bottom()
 
     def set_busy_status(self, label, elapsed, stalled=False):
         dots = "·" * ((elapsed % 3) + 1)
@@ -537,11 +543,39 @@ class ChatWindow(QWidget):
             self.append(self.assistant_name(), text)
         else:
             self.changed.emit()
+            self._stick_to_bottom()
         self.streaming = False
         self.current_bubble = None
         self.send_button.setEnabled(True)
         self.stop_button.hide()
         self._refresh_retry()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._pending_tail:
+            QTimer.singleShot(0, self._stick_to_bottom)
+
+    def _stick_to_bottom(self):
+        """Keep the latest reply in view while its height is still settling."""
+        self._stick = True
+        self._pending_tail = True
+        self._scroll_to_bottom()
+        self._tail_timer.start(200)
+
+    def _release_tail(self):
+        self._scroll_to_bottom()
+        self._stick = False
+        if self.isVisible():
+            self._pending_tail = False
+
+    def _follow_tail(self, _minimum, maximum):
+        if self._stick:
+            self.area.verticalScrollBar().setValue(maximum)
+
+    def _scroll_to_bottom(self):
+        self.messages.adjustSize()
+        bar = self.area.verticalScrollBar()
+        bar.setValue(bar.maximum())
 
     def _refresh_retry(self):
         self.retry_button.setVisible(self.send_button.isEnabled() and bool(self.last_user_text()))
