@@ -514,6 +514,10 @@ def kind_for(app, class_name, title):
     lowered = (title or "").lower()
     if lowered.endswith(" - cursor") or "visual studio code" in lowered or lowered.endswith(" - notepad"):
         return "editor"
+    if any(ext in lowered for ext in (".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt")) and any(
+        token in lowered for token in ("wps", "kingsoft", "microsoft word", "- excel", "- powerpoint")
+    ):
+        return "document"
     if class_name in CLASS_KIND:
         return CLASS_KIND[class_name]
     if "chrome_widgetwin" in class_name.lower():
@@ -814,7 +818,7 @@ def _describe(hwnd, own_ids, folders):
         return None
     if _is_ignored_layer(hwnd, image, title, box):
         return None
-    cwd, _command = _process_strings(pid)
+    cwd, command = _process_strings(pid)
     folder = folders.get(number & 0xFFFFFFFF)
     described = {
         "id": _wid(number),
@@ -822,6 +826,7 @@ def _describe(hwnd, own_ids, folders):
         "app": image or class_name or "应用",
         "pid": pid,
         "cwd": cwd,
+        "command": (command or "")[:4000],
         "rect": box,
         "bounds": box,
         "kind": kind,
@@ -953,7 +958,12 @@ def _set_z(hwnd, after):
     user32().SetWindowPos(_as_hwnd(hwnd), _as_hwnd(after), 0, 0, 0, 0, _SWP_LAYER)
 
 
-def _window_above(hwnd, skip):
+def _same_band_above(hwnd, skip, owner_top):
+    """The next visible window above hwnd in the same topmost band.
+
+    Topmost helpers such as the home perch sit above every normal window.
+    Treating one of them as the ceiling pulls the border over other apps.
+    """
     current = user32().GetWindow(_as_hwnd(hwnd), _GW_HWNDPREV)
     seen = set()
     while current:
@@ -961,7 +971,10 @@ def _window_above(hwnd, skip):
         if not number or number in seen:
             return 0
         seen.add(number)
-        if number not in skip:
+        if _is_topmost(number) != owner_top:
+            return 0
+        visible = user32().IsWindowVisible(_as_hwnd(number)) and not user32().IsIconic(_as_hwnd(number)) and not _cloaked(number)
+        if number not in skip and visible:
             return number
         current = user32().GetWindow(current, _GW_HWNDPREV)
     return 0
@@ -972,7 +985,7 @@ def _stacked_above(owner, group):
     current = owner
     owner_top = _is_topmost(owner)
     for hwnd in group:
-        current = _window_above(current, set())
+        current = _same_band_above(current, set(), owner_top)
         if current != hwnd or _is_topmost(hwnd) != owner_top:
             return False
     return True
@@ -1005,7 +1018,9 @@ def stack_with_window(owner, followers):
             _set_z(hwnd, _HWND_TOPMOST if owner_top else _HWND_NOTOPMOST)
     if _stacked_above(owner, group):
         return
-    anchor = _window_above(owner, set(group)) or 0
+    anchor = _same_band_above(owner, set(group), owner_top)
+    if not anchor:
+        anchor = _HWND_TOPMOST if owner_top else 0
     for hwnd in reversed(group):
         _set_z(hwnd, anchor)
         anchor = hwnd

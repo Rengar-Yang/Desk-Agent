@@ -4,7 +4,7 @@ import math
 import time
 
 from PyQt5.QtCore import QRect, Qt, QTimer
-from PyQt5.QtGui import QColor, QPainter, QPen
+from PyQt5.QtGui import QColor, QPainter, QPen, QRegion
 from PyQt5.QtWidgets import QWidget
 
 from orbit.theme import ACCENTS
@@ -12,17 +12,20 @@ from orbit.ui.fonts import ui_font
 
 
 class TargetOverlay(QWidget):
-    """A click-through target outline and hint while the mascot is dragged."""
+    """A click-through outline. Z-order is owned by the pet, not by a topmost flag."""
 
     def __init__(self):
-        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.WindowTransparentForInput)
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowTransparentForInput)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.target = None
         self.show_hint = True
         self.connected = False
         self.accent = "#8a72d5"
         self.connected_at = None
+        self._holes = []
+        self._hole_key = ()
         self.pulse = QTimer(self)
         self.pulse.timeout.connect(self.update)
         self.pulse.start(16)
@@ -32,6 +35,9 @@ class TargetOverlay(QWidget):
             self.target = None
             self.connected = False
             self.connected_at = None
+            self._holes = []
+            self._hole_key = ()
+            self.clearMask()
             self.hide()
             return
         switched = not self.target or self.target.get("id") != target.get("id") or self.connected != connected
@@ -46,9 +52,41 @@ class TargetOverlay(QWidget):
         rect = target["rect"]
         pad = 26
         self.setGeometry(rect.adjusted(-pad, -pad, pad, pad))
+        self._apply_hole()
         if switched:
             self.show()
         self.update()
+
+    def avoid(self, holes):
+        """Drop the frame where the mascot or the chat sits. Rects are in screen coordinates."""
+        if holes is None:
+            items = []
+        elif isinstance(holes, QRect):
+            items = [holes]
+        else:
+            items = list(holes)
+        cleaned = []
+        for rect in items:
+            hole = QRect(rect)
+            if hole.isNull() or hole.isEmpty():
+                continue
+            cleaned.append(hole)
+        key = tuple((hole.x(), hole.y(), hole.width(), hole.height()) for hole in cleaned)
+        if key == self._hole_key:
+            return
+        self._holes = cleaned
+        self._hole_key = key
+        self._apply_hole()
+
+    def _apply_hole(self):
+        if not self._holes:
+            self.clearMask()
+            return
+        region = QRegion(self.rect())
+        for hole in self._holes:
+            local = QRect(self.mapFromGlobal(hole.topLeft()), hole.size())
+            region = region.subtracted(QRegion(local))
+        self.setMask(region)
 
     def paintEvent(self, _event):
         if not self.target:

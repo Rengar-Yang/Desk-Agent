@@ -5,7 +5,7 @@ import time
 
 from PyQt5.QtCore import QObject, pyqtSignal
 
-from orbit.desktop.session import query_window_presence, query_windows, window_is_covered
+from orbit.desktop.session import query_window_presence, query_windows
 
 
 class WindowProbe(QObject):
@@ -56,25 +56,17 @@ class WindowProbe(QObject):
     def _watch_loop(self):
         last = None
         seen = None
-        covered = False
-        checked = 0.
-        cache = {}
         while True:
             with self._lock:
                 wid = self._watch
-                own_ids = set(self._own_ids)
                 if wid is None:
                     if self._watch is None:
                         self._watch_running = False
                         return
                     wid = self._watch
-                    own_ids = set(self._own_ids)
             if wid != seen:
                 seen = wid
                 last = None
-                covered = False
-                checked = 0.
-                cache = {}
             try:
                 presence, rect = query_window_presence(wid)
             except Exception:
@@ -84,14 +76,8 @@ class WindowProbe(QObject):
             elif presence == "hidden":
                 state = ("hidden",)
             else:
-                now = time.monotonic()
-                if now - checked > 0.2:
-                    checked = now
-                    try:
-                        covered = window_is_covered(wid, rect, own_ids, cache)
-                    except Exception:
-                        covered = False
-                state = (rect, covered)
+                # Another window covers this one through normal z-order. Do not hide Orbit for that.
+                state = (rect, False)
             if state != last:
                 last = state
                 self.placed.emit(wid, state)

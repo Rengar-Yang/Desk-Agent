@@ -14,6 +14,8 @@ from orbit.desktop.files import (
     SKIP_DIRS, list_directory, read_text_preview, resolve_path_buttons, unique_directory_named,
 )
 from orbit.desktop.common import classify_window
+from orbit.desktop.docx import read_docx_preview
+from orbit.desktop.office import document_name, is_blocked_dir, locate_document
 from orbit.theme import ACCENTS, KIND_LABELS
 
 SHELL_NAMES = {"bash", "zsh", "fish", "sh", "dash", "cmd", "powershell", "pwsh"}
@@ -244,6 +246,13 @@ def foreground_commands(root_pid, cwd, limit=4):
                 return lines
     return lines
 
+def _looks_like_document(title, app):
+    if not document_name(title):
+        return False
+    blob = f"{title} {app or ''}".lower()
+    return any(token in blob for token in ("wps", "kingsoft", "word", "excel", "powerpoint"))
+
+
 def capture_context(window):
     """Attach a path, listing, and bounded text preview to a window description."""
     kind = window.get("kind") or classify_window(window.get("app", ""))
@@ -299,9 +308,32 @@ def capture_context(window):
     elif kind == "browser":
         detail = snapshot.get("url") or "未暴露页面地址，可以依据标题协助"
         path = None
+    elif kind == "document" or _looks_like_document(title, window.get("app")):
+        kind = "document"
+        try:
+            file_path = locate_document(title, window.get("command") or "")
+        except Exception:
+            file_path = None
+        if file_path:
+            path = file_path
+            try:
+                preview = read_docx_preview(file_path, get_config().context.preview_chars)
+            except Exception:
+                preview = None
+            if preview:
+                detail = "已读取文档段落"
+            elif file_path.suffix.lower() in {".docx", ".docm"}:
+                detail = "已定位文档，正文改由工具读取"
+            else:
+                detail = "已定位文件，目前可以直接改的是 .docx"
+        else:
+            detail = "还没定位到文件路径"
     if path is None and kind == "other":
         cwd = window.get("cwd")
-        if cwd and Path(cwd) not in (Path.home(), Path("/")) and Path(cwd).is_dir():
+        if (
+            cwd and Path(cwd).is_dir() and not is_blocked_dir(cwd)
+            and Path(cwd) not in (Path.home(), Path("/"))
+        ):
             path = Path(cwd)
             entries = list_directory(path, get_config().context.directory_limit)
     summary = " · ".join(part for part in (str(path) if path else "", detail) if part)
@@ -315,6 +347,10 @@ def capture_context(window):
         detail_level = "cwd"
     elif kind == "browser" and snapshot.get("url"):
         detail_level = "url"
+    elif kind == "document" and path and preview:
+        detail_level = "file"
+    elif kind == "document" and path:
+        detail_level = "file_meta"
     elif path:
         detail_level = "cwd"
     else:
@@ -346,7 +382,13 @@ def context_prompt(window, cwd):
         lines.append(f"目标路径：{target}")
         if cwd and os.path.normpath(cwd) != os.path.normpath(target):
             lines.append(f"可写目录：{cwd}")
-        lines.append("只根据目标路径和下面的目录内容回答，不要改用用户主目录。")
+        if window.get("kind") == "document":
+            lines.append("目标就是这份文档。用 read_document 读取正文，用 edit_document 直接修改 .docx。")
+            lines.append("用户要求修改时立刻调用 edit_document 并直接写入，不要询问是否执行，也不要让用户自己去改。")
+            lines.append("没有 edit_document 返回已写入或已改好之前，禁止说已经改好、已替换或命令已执行。")
+            lines.append("不要要求用户另存为 txt，不要说没有权限，也不要改去别的目录。")
+        else:
+            lines.append("只根据目标路径和下面的目录内容回答，不要改用用户主目录。")
     elif cwd and Path(cwd) != Path.home():
         lines.append(f"工作目录：{cwd}")
     else:
@@ -360,6 +402,8 @@ def context_prompt(window, cwd):
         lines.append("该目录中的活动命令：\n" + "\n".join(f"- {entry}" for entry in entries[:8]))
     preview = window.get("preview")
     if preview:
+        if window.get("kind") == "document":
+            lines.append("下面是文档段落。行首序号不是正文，edit_document 的 old 不要带序号。")
         lines.append("文本内容开头：\n" + preview[:get_config().context.preview_chars])
     elif window.get("kind") == "browser" and not window.get("url"):
         lines.append("浏览器没有暴露页面正文。若已知地址，请用工具抓取页面，不要只根据标题编造正文。")

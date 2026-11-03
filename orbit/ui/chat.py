@@ -3,7 +3,7 @@
 import time
 
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
-from PyQt5.QtGui import QColor, QGuiApplication, QPixmap, QTextCursor
+from PyQt5.QtGui import QColor, QPixmap, QTextCursor
 from PyQt5.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton, QScrollArea, QSizeGrip,
     QSizePolicy, QVBoxLayout, QWidget,
@@ -40,10 +40,9 @@ class Composer(QPlainTextEdit):
         super().inputMethodEvent(event)
 
     def keyPressEvent(self, event):
-        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (event.modifiers() & Qt.ShiftModifier):
-            visible = QGuiApplication.inputMethod()
-            composing = bool(self._preedit) or bool(visible and visible.isVisible())
-            if composing:
+        modifiers = event.modifiers() & ~Qt.KeypadModifier
+        if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (modifiers & Qt.ShiftModifier):
+            if self._preedit:
                 super().keyPressEvent(event)
                 return
             self.submit_requested.emit()
@@ -88,16 +87,45 @@ class TextBubble(QLabel):
         self.setText(markdown_to_html(self.visible_text()))
 
 
+class HeaderDrag(QWidget):
+    """Drag the chat window from its title row."""
+
+    def __init__(self, window):
+        super().__init__()
+        self._window = window
+        self._offset = None
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._offset = event.globalPos() - self._window.frameGeometry().topLeft()
+            self._window.placed_by_user = True
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._offset is not None and event.buttons() & Qt.LeftButton:
+            self._window.move(event.globalPos() - self._offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._offset = None
+        super().mouseReleaseEvent(event)
+
+
 class ChatWindow(QWidget):
     send = pyqtSignal(str)
     stop = pyqtSignal()
     close_requested = pyqtSignal()
     reread = pyqtSignal()
     regenerate = pyqtSignal()
+    clear_history = pyqtSignal()
     changed = pyqtSignal()
 
     def __init__(self):
-        super().__init__(None, Qt.Dialog | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        super().__init__(None, Qt.Dialog | Qt.FramelessWindowHint)
         self.setFont(ui_font(13))
         self.setWindowModality(Qt.NonModal)
         self.setAttribute(Qt.WA_InputMethodEnabled, True)
@@ -113,27 +141,39 @@ class ChatWindow(QWidget):
         self._resize_until = 0.
         self._press_global = None
         self._press_geom = None
+        self.placed_by_user = False
         self.accent = ACCENTS["other"]
         root = QVBoxLayout(self)
         root.setContentsMargins(17, 16, 17, 12)
         root.setSpacing(10)
         header = QHBoxLayout()
+        drag = HeaderDrag(self)
+        drag_layout = QHBoxLayout(drag)
+        drag_layout.setContentsMargins(0, 0, 0, 0)
+        drag_layout.setSpacing(8)
         self.icon = QLabel()
         self.icon.setFixedSize(36, 36)
         self.icon.setAlignment(Qt.AlignCenter)
         self.icon.setPixmap(QPixmap.fromImage(render_mascot(36)))
-        header.addWidget(self.icon)
+        self.icon.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        drag_layout.addWidget(self.icon)
         heading = QVBoxLayout()
         heading.setSpacing(1)
         self.title = QLabel("Orbit AI")
         self.title.setObjectName("chatTitle")
+        self.title.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.context = QLabel("待命中 · 可以直接聊天")
         self.context.setObjectName("chatPath")
-        self.context.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.context.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.context.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         heading.addWidget(self.title)
         heading.addWidget(self.context)
-        header.addLayout(heading, 1)
+        drag_layout.addLayout(heading, 1)
+        header.addWidget(drag, 1)
+        self.clear_button = QPushButton("删除历史")
+        self.clear_button.setObjectName("clearButton")
+        self.clear_button.clicked.connect(self.clear_history.emit)
+        header.addWidget(self.clear_button, 0, Qt.AlignTop)
         close = QPushButton("×")
         close.setObjectName("closeButton")
         close.setFixedSize(29, 29)
@@ -241,8 +281,8 @@ class ChatWindow(QWidget):
             #closeButton {{ background: transparent; color: #89849b; font-size: 20px; }}
             #stopButton {{ background: #f3e4e8; color: #8d3d4a; font-weight: 600; }}
             #stopButton:hover {{ background: #ead4da; }}
-            #retryButton, #copyButton, #rereadButton {{ background: transparent; color: #8b82a7; padding: 2px 6px; font-size: 12px; }}
-            #retryButton:hover, #copyButton:hover, #rereadButton:hover {{ color: {accent}; background: transparent; }}
+            #retryButton, #copyButton, #rereadButton, #clearButton {{ background: transparent; color: #8b82a7; padding: 2px 6px; font-size: 12px; }}
+            #retryButton:hover, #copyButton:hover, #rereadButton:hover, #clearButton:hover {{ color: {accent}; background: transparent; }}
             #sizeGrip {{ background: transparent; width: 14px; height: 14px; }}
             #messageArea, #messageArea QWidget {{ border: 0; background: #fdfdff; }}
             #messageArea QScrollBar:vertical {{ background: transparent; width: 8px; margin: 4px 2px 4px 0; }}
@@ -274,7 +314,10 @@ class ChatWindow(QWidget):
                 self.context_title.setText(context_headline(level))
                 self.context_text.setText(self._context_body(target, level))
                 prompts = suggestion_prompts(target)
-            self.footnote.setText("✦ 写入和命令会先确认，可对本目录选择本次允许")
+            if kind == "document":
+                self.footnote.setText("✦ Enter 发送，Shift+Enter 换行 · 改文档会直接写入")
+            else:
+                self.footnote.setText("✦ Enter 发送，Shift+Enter 换行 · 写入和命令会先确认")
             reread = QPushButton("重新读取")
             reread.setObjectName("rereadButton")
             reread.clicked.connect(self.reread.emit)

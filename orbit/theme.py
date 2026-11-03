@@ -8,12 +8,14 @@ _FALLBACK_ACCENTS = {
     "browser": "#d8966f",
     "terminal": "#2f9d86",
     "other": "#8370da",
+    "document": "#6e8ed6",
 }
 KIND_LABELS = {
     "files": "文件管理器",
     "editor": "代码编辑器",
     "browser": "浏览器",
     "terminal": "终端",
+    "document": "文档",
     "other": "窗口",
 }
 _FALLBACK_PROMPTS = {
@@ -21,6 +23,7 @@ _FALLBACK_PROMPTS = {
     "editor": ["解释当前文件", "检查可能的问题", "基于这个文件继续改"],
     "browser": ["总结当前页面", "提炼三个要点", "我下一步该看什么？"],
     "terminal": ["当前目录在做什么？", "解释正在运行的命令", "下一步该运行什么？"],
+    "document": ["读一下这份文档", "修改文档里的一段文字", "总结这份文档"],
     "other": ["这个窗口是做什么的？", "给我下一步建议", "帮我处理手头的事"],
     None: ["聊聊今天的计划", "给我一个灵感", "你能做什么？"],
 }
@@ -29,6 +32,7 @@ _PROMPT_KEYS = {
     "editor": "editor",
     "browser": "browser",
     "terminal": "terminal",
+    "document": "document",
     "other": "other",
     "idle": None,
 }

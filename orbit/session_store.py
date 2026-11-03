@@ -129,6 +129,23 @@ def save_window(window, messages, api_history):
     _write(store)
 
 
+def forget_window(window):
+    """Drop every saved transcript that belongs to this window."""
+    keys = window_keys(window)
+    if not keys:
+        return
+    store = load_store()
+    for key in keys:
+        store["windows"].pop(key, None)
+    _write(store)
+
+
+def forget_idle():
+    store = load_store()
+    store["idle"] = _record([], [])
+    _write(store)
+
+
 def load_idle():
     return load_store()["idle"]
 

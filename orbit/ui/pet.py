@@ -13,18 +13,21 @@ from PyQt5.QtCore import (
     QAbstractAnimation, QAbstractNativeEventFilter, QObject, QPoint, QPointF, QRect, QRectF, Qt, QThread, QTimer,
     QEasingCurve, QPropertyAnimation, pyqtSignal,
 )
-from PyQt5.QtGui import QColor, QCursor, QPainter, QPen, QPolygon, QRegion
+from PyQt5.QtGui import QColor, QCursor, QPainter, QPainterPath, QPen, QPolygon, QRegion
 from PyQt5.QtWidgets import QApplication, QDialog, QMessageBox, QSystemTrayIcon, QWidget
 
 from orbit.agent.api_client import ApiError, CancelledApi, RetryableApiError, request_completion
 from orbit.agent.codex import CodexBridge, find_codex
 from orbit.agent.safety import FileUndo, TaskGrants
-from orbit.agent.tools import API_TOOLS, api_error_text, kill_running_shell, run_tool, tool_label
+from orbit.agent.tools import (
+    API_TOOLS, api_error_text, claims_unverified_edit, edit_succeeded, kill_running_shell, run_tool, tool_label,
+)
 from orbit.config import (
     BASE_CANVAS, BASE_PAINT_SCALE, follow_interval, get_config, load_api_token, load_user_settings,
     mascot_scale, save_api_token, save_user_settings,
 )
-from orbit.session_store import load_idle, recall_window, save_idle, save_window
+from orbit.logbook import record as log_event
+from orbit.session_store import forget_idle, forget_window, load_idle, recall_window, save_idle, save_window
 from orbit.presets import preset_by_id
 from orbit.desktop.context import capture_context, context_prompt
 from orbit.desktop.common import float_above, focus_window, hydrate_window, stack_with_window, topmost_at
@@ -91,13 +94,14 @@ class Pet(QWidget):
     tools_ready = pyqtSignal(int, object, object)
     confirm_request = pyqtSignal()
     def __init__(self):
-        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint)
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setMouseTracking(True)
         self.settings = load_user_settings()
         self._mask_key = None
         self.apply_mascot_scale(mascot_scale(self.settings))
         self.docked = True
+        self.hanging = False
         self.drag_growth = 1.
         self.drag_from_home = False
         self.next_idle = time.monotonic() + random.uniform(4, 9)
@@ -135,6 +139,10 @@ class Pet(QWidget):
         self.chat.close_requested.connect(self.close_chat)
         self.chat.reread.connect(self.reread_context)
         self.chat.regenerate.connect(self.regenerate_last)
+        self.chat.clear_history.connect(self.clear_conversation)
+        self.target = None
+        self._transcript_window = None
+        self._history_loaded = False
         self.chat.changed.connect(self.persist_session)
         idle = load_idle()
         if idle["messages"] and self.chat.restore_messages(idle["messages"]):
@@ -145,6 +153,7 @@ class Pet(QWidget):
         self.bridge.delta.connect(self.chat.add_delta)
         self.bridge.finished.connect(self.on_finished)
         self.bridge.error.connect(self.on_error)
+        self._overlay_hole_key = None
         self.tether = TetherWindow()
         self.tether.snapped.connect(self._on_tether_snapped)
         self._close_notch_after_snap = False
@@ -152,9 +161,6 @@ class Pet(QWidget):
         self.overlay = TargetOverlay()
         self.drag_start = None
         self.dragged = False
-        self.target = None
-        self._transcript_window = None
-        self._history_loaded = False
         self.hover_target = None
         self.cached_windows = []
         self.held_id = None
@@ -175,6 +181,11 @@ class Pet(QWidget):
         self.slip_v = 0.
         self.lean = 0.
         self.lean_v = 0.
+        self.hang_y = 0.
+        self.hang_yv = 0.
+        self.hang_a = 0.
+        self.hang_av = 0.
+        self.hang_glide_until = 0.
         self.ride_vx = 0.
         self.ride_vy = 0.
         self.ride_at = 0.
@@ -217,6 +228,7 @@ class Pet(QWidget):
         self.notch.reveal(screen)
         self.show()
         self.refresh_mask()
+        self._float_layer()
         self.tray = None
         if QSystemTrayIcon.isSystemTrayAvailable():
             self.tray = OrbitTray(self)
@@ -272,6 +284,23 @@ class Pet(QWidget):
             self.slip += self.slip_v * frame
             self.lean_v += (-38 * self.lean - 9 * self.lean_v) * frame
             self.lean += self.lean_v * frame
+        if self.hanging and self.target and not self.docked and not self.drag_start:
+            pull = 1.2 if self.mood in ("thinking", "working") else 0.85
+            target_y = pull * (4.4 + 1.5 * math.sin(now * 0.82))
+            target_a = pull * 2.1 * math.sin(now * 0.58 + 0.7)
+            # The catch is overdamped: release eases into the band instead of bouncing.
+            soft = now < self.hang_glide_until
+            k_y, d_y = (22, 12) if soft else (12, 7.2)
+            k_a, d_a = (14, 9) if soft else (10, 6.4)
+            self.hang_yv += ((target_y - self.hang_y) * k_y - d_y * self.hang_yv) * frame
+            self.hang_y += self.hang_yv * frame
+            self.hang_av += ((target_a - self.hang_a) * k_a - d_a * self.hang_av) * frame
+            self.hang_a += self.hang_av * frame
+        else:
+            self.hang_yv += (-20 * self.hang_y - 6.5 * self.hang_yv) * frame
+            self.hang_y += self.hang_yv * frame
+            self.hang_av += (-18 * self.hang_a - 6 * self.hang_av) * frame
+            self.hang_a += self.hang_av * frame
         if self.target and not self.docked and not self.buried and not self.drag_start:
             self._raise_attached()
         self.refresh_mask()
@@ -326,8 +355,11 @@ class Pet(QWidget):
         y, angle, sx, sy = 0., 0., 1., 1.
         wave = lambda duration: (1 - math.cos(elapsed * 2 * math.pi / duration)) / 2
         holding = self.target and not self.docked and (self.grip > 0.08 or abs(self.slip) > 0.45 or abs(self.lean) > 0.45)
+        hanging = bool(self.hanging and self.target and not self.docked)
         if self.mood == "idle" and not self.docked:
-            if holding:
+            if hanging:
+                pass
+            elif holding:
                 y = self.slip * 0.85
                 angle = self.lean
                 sx, sy = 1 + .07 * self.grip, 1 - .1 * self.grip
@@ -338,22 +370,24 @@ class Pet(QWidget):
         elif self.mood == "dragging":
             sx, sy = 1.06 + .04 * wave(.68), .94 + .04 * (1 - wave(.68))
         elif self.mood in ("thinking", "working"):
-            # No whole-body bounce while busy. Perched paws do the work in paintEvent;
-            # on the home notch, sway sideways only.
-            if self.target and not self.docked:
+            # Perched paws stay on the window edge. A fullscreen hang uses the short
+            # elastic below instead of this sway. On the home notch, sway sideways only.
+            if hanging:
+                pass
+            elif self.target and not self.docked:
                 y, angle, sx, sy = 0., 0., 1., 1.
             else:
                 y, sx, sy = 0., 1., 1.
                 angle = 7 * math.sin(elapsed * 2 * math.pi / .72)
         idle_progress = max(0., min(1., 1 - (self.idle_until - time.monotonic()) / .9))
         idle_wave = math.sin(idle_progress * math.pi) if time.monotonic() < self.idle_until else 0.
-        if self.mood == "idle" and self.idle_kind == "hop":
+        if self.mood == "idle" and self.idle_kind == "hop" and not hanging:
             y -= 6 * idle_wave
             sx += .04 * idle_wave
             sy -= .06 * idle_wave
         frames = None
         progress = 1.
-        if self.landing_started is not None:
+        if self.landing_started is not None and not hanging:
             progress = (time.monotonic() - self.landing_started) / .78
             frames = [(0, -28, 0, .65, 1.45), (.27, 8, 0, 1.34, .66), (.48, -12, 0, .82, 1.25), (.66, 4, 0, 1.13, .85), (.82, -3, 0, .94, 1.07), (1, 0, 0, 1, 1)]
         elif self.mood == "done":
@@ -368,7 +402,12 @@ class Pet(QWidget):
                     break
         elif self.landing_started is not None:
             landing_done = True
-        if holding and self.mood in ("thinking", "working") and not (frames and progress < 1):
+        if hanging and not (frames and progress < 1):
+            # Translation only. Squash would turn the round body into a narrow oval.
+            y = self.hang_y
+            angle = self.hang_a
+            sx, sy = 1., 1.
+        elif holding and self.mood in ("thinking", "working") and not (frames and progress < 1):
             # Keep the body planted while busy; only follow hard window motion.
             y += self.slip * 0.25
             angle += self.lean * 0.25
@@ -379,14 +418,14 @@ class Pet(QWidget):
             sy -= .07 * self.grip
         return y, angle, sx, sy, idle_wave, landing_done, progress
 
-    def _map_local(self, lx, ly, origin_x, origin_y, scale, lift, angle, sx, sy):
+    def _map_local(self, lx, ly, origin_x, origin_y, scale, lift, angle, sx, sy, pivot=43):
         dx = (lx - 41) * sx
-        dy = (ly - 43) * sy
+        dy = (ly - pivot) * sy
         rad = math.radians(angle)
         cos, sin = math.cos(rad), math.sin(rad)
         return (
             origin_x + scale * (41 + dx * cos - dy * sin),
-            origin_y + scale * (43 + lift + dx * sin + dy * cos),
+            origin_y + scale * (pivot + lift + dx * sin + dy * cos),
         )
 
     @staticmethod
@@ -404,9 +443,10 @@ class Pet(QWidget):
         origin_x, origin_y, scale = self.placement()
         lift, angle, sx, sy, _idle, _done, _progress = self._motion_pose()
         stretch = max(abs(sx), abs(sy), 1.0)
+        pivot = 43
 
         def cover(lx, ly, radius):
-            cx, cy = self._map_local(lx, ly, origin_x, origin_y, scale, lift, angle, sx, sy)
+            cx, cy = self._map_local(lx, ly, origin_x, origin_y, scale, lift, angle, sx, sy, pivot)
             pad = 6
             return self._disk(cx, cy, radius * scale * stretch + pad, radius * scale * stretch + pad)
 
@@ -414,6 +454,9 @@ class Pet(QWidget):
         region = region.united(cover(21, 15, 20))
         region = region.united(cover(61, 15, 20))
         show_paws = bool(self.target) and not self.docked
+        if show_paws and self.hanging:
+            region = region.united(cover(41, -2, 14))
+            region = region.united(cover(41, 8, 12))
         if show_paws:
             # Cover the working stroke range so alternating paws stay clickable.
             region = region.united(cover(25, 74, 18))
@@ -422,11 +465,11 @@ class Pet(QWidget):
                 region = region.united(cover(25, 64, 18))
                 region = region.united(cover(57, 64, 18))
         if self.mood in ("thinking", "working", "done"):
-            region = region.united(cover(70, 10, 18))
+            region = region.united(cover(70, 46 if self.hanging else 10, 18))
         if self.landing_started is not None:
             region = region.united(cover(41, 41, 64))
         bounds = region.boundingRect()
-        key = (bounds.getRect(), show_paws, self.mood, round(lift), round(angle), round(sx * 8), round(sy * 8))
+        key = (bounds.getRect(), show_paws, self.hanging, self.mood, round(lift), round(angle), round(sx * 8), round(sy * 8))
         if key == self._mask_key:
             return
         self._mask_key = key
@@ -452,7 +495,7 @@ class Pet(QWidget):
         self.context_token += 1
         self.context_pending = True
         token = self.context_token
-        snapshot = {key: window.get(key) for key in ("id", "title", "app", "pid", "cwd", "kind")}
+        snapshot = {key: window.get(key) for key in ("id", "title", "app", "pid", "cwd", "kind", "command")}
         rect = window["rect"]
         snapshot["rect"] = (rect.x(), rect.y(), rect.width(), rect.height())
         threading.Thread(target=self._capture_context, args=(token, window["id"], snapshot), daemon=True).start()
@@ -460,7 +503,14 @@ class Pet(QWidget):
     def _capture_context(self, token, window_id, snapshot):
         try:
             context = capture_context(snapshot)
-        except Exception:
+        except Exception as error:
+            try:
+                log = Path(os.environ.get("APPDATA", ".")) / "orbit-codex" / "startup.log"
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("capture failed: " + str(error) + "\n")
+            except OSError:
+                pass
+            log_event("error", "读取窗口失败", detail=error)
             context = {
                 "kind": snapshot.get("kind") or "other",
                 "accent": ACCENTS["other"],
@@ -470,9 +520,41 @@ class Pet(QWidget):
         self.context_bridge.ready.emit(token, window_id, context)
 
     def apply_context(self, token, window_id, context):
+        try:
+            self._apply_context(token, window_id, context)
+        except Exception as error:
+            log_event("error", "应用窗口内容失败", detail=error)
+            self.context_pending = False
+            if self.chat.isVisible():
+                self.chat.append(self.chat.assistant_name(), "读这个窗口时出错了，可以再拖一次或点「重新读取」。")
+            pending = self.pending_message
+            self.pending_message = None
+            if pending:
+                self.ask(pending)
+                return
+            self.end_activity()
+            self.chat.streaming = False
+            self.chat.send_button.setEnabled(True)
+            self.chat.stop_button.hide()
+
+    def _apply_context(self, token, window_id, context):
         if token != self.context_token or not self.target or self.target.get("id") != window_id:
             return
+        if not context.get("path") and self.target.get("path"):
+            context = dict(context)
+            context["path"] = self.target.get("path")
+            if not context.get("preview") and self.target.get("preview"):
+                context["preview"] = self.target.get("preview")
+            if context.get("detail_level") == "title" and self.target.get("detail_level"):
+                context["detail_level"] = self.target.get("detail_level")
         self.target.update(context)
+        log_event(
+            "context",
+            self.target.get("title") or "",
+            kind=self.target.get("kind"),
+            path=self.target.get("path"),
+            level=self.target.get("detail_level"),
+        )
         self.context_pending = False
         self.chat.set_context(self.target)
         self.note_grant()
@@ -516,6 +598,12 @@ class Pet(QWidget):
             return f"已连接「{title}」。只拿到地址 {target['url']}，没有页面正文。需要正文时我会尝试抓取这个地址。"
         if kind == "browser":
             return f"已连接「{title}」。现在只有窗口标题，没有页面地址和正文，不能据此编造内容。"
+        if kind == "document" and path and level == "file":
+            return f"已连接「{title}」。这是文档 {path}，我可以直接读取和修改里面的文字。"
+        if kind == "document" and path:
+            return f"已连接「{title}」。定位到 {path}。docx 可以直接改。"
+        if kind == "document":
+            return f"已连接「{title}」。还没找到文件的真实路径，所以暂时不能改正文。"
         if path:
             return f"已连接「{title}」。相关路径是 {path}。"
         return f"已连接「{title}」。只认出了{KIND_LABELS.get(kind, '窗口')}，没有解析出可操作的路径或正文。"
@@ -525,8 +613,46 @@ class Pet(QWidget):
         self.mood = mood
         self.update()
 
+    @staticmethod
+    def _as_point(value):
+        if isinstance(value, QPoint):
+            return value
+        try:
+            return QPoint(int(value.x()), int(value.y()))
+        except (AttributeError, TypeError, ValueError):
+            return None
+
     def animate_to(self, point, duration=500):
         self.animation.stop()
+        self.animation.setEasingCurve(QEasingCurve.OutBack)
+        self.animation.setDuration(duration)
+        self.animation.setStartValue(self.pos())
+        self.animation.setEndValue(point)
+        self.animation.start()
+
+    def _catch_into_hang(self):
+        """Drop the ledge-bounce and let a short band ease the body into the hang."""
+        now = time.monotonic()
+        self.landing_started = None
+        self.bounce = 0
+        # Continue from the drag pose (no vertical pop) and sag into the band.
+        self.hang_y = 0.
+        self.hang_yv = 72.
+        self.hang_a = 0.
+        self.hang_av = 0.
+        self.hang_glide_until = now + 0.56
+
+    def _glide_hang(self, point):
+        """Slide to the top edge without the overshoot used for perching."""
+        end = self._as_point(self.animation.endValue())
+        running = self.animation.state() == QAbstractAnimation.Running
+        if running and end is not None and (end - point).manhattanLength() <= 36:
+            return
+        distance = math.hypot(point.x() - self.x(), point.y() - self.y())
+        duration = int(max(320, min(560, 200 + distance * 0.42)))
+        self.hang_glide_until = max(self.hang_glide_until, time.monotonic() + duration / 1000)
+        self.animation.stop()
+        self.animation.setEasingCurve(QEasingCurve.OutCubic)
         self.animation.setDuration(duration)
         self.animation.setStartValue(self.pos())
         self.animation.setEndValue(point)
@@ -542,7 +668,7 @@ class Pet(QWidget):
             self.notch.reveal(QApplication.primaryScreen().availableGeometry())
             self.refresh_mask()
             self.update()
-            self.raise_()
+            self._float_layer()
 
     def move_chat(self):
         screen = QApplication.screenAt(self.frameGeometry().center()) or QApplication.primaryScreen()
@@ -559,18 +685,44 @@ class Pet(QWidget):
         x = right if right + self.chat.width() <= area.right() - 8 else left
         x = max(area.left() + 8, min(x, area.right() - self.chat.width() - 8))
         y = max(area.top() + 8, min(y_anchor, area.bottom() - self.chat.height() - 8))
-        if not self.chat.is_user_resizing():
+        if not self.chat.is_user_resizing() and not self.chat.placed_by_user:
             self.chat.move(x, y)
+
+    def _should_hang(self, rect):
+        """Hang inside a window when perching would put the body above the screen."""
+        screen = QApplication.screenAt(rect.center()) or QApplication.primaryScreen()
+        if screen is None or rect.height() < 280 or rect.width() < 280:
+            return False
+        work = screen.availableGeometry()
+        return rect.top() - round(64 * self.pet_scale) < work.top() + 4
 
     def place_on_window(self, rect, allow_bounce=False):
         """Move the mascot and the chat together so they stay locked to the window."""
-        destination = QPoint(rect.center().x() - self.width() // 2, rect.top() - round(self.contact_y()))
+        entering_hang = self._should_hang(rect) and not self.hanging and self.drag_start is None
+        self.hanging = self._should_hang(rect)
+        if entering_hang:
+            self._catch_into_hang()
+        if self.hanging:
+            screen = QApplication.screenAt(rect.center()) or QApplication.primaryScreen()
+            visible_top = rect.top()
+            if screen is not None:
+                visible_top = max(rect.top(), screen.geometry().top())
+            _origin_x, origin_y, _scale = self.placement()
+            top = visible_top + 2 - round(origin_y)
+            destination = QPoint(rect.center().x() - self.width() // 2, top)
+        else:
+            destination = QPoint(rect.center().x() - self.width() // 2, rect.top() - round(self.contact_y()))
         if self.pos() != destination:
-            if allow_bounce and self.bounce:
+            gliding = self.hanging and time.monotonic() < self.hang_glide_until
+            if gliding:
+                self._glide_hang(destination)
+            elif allow_bounce and self.bounce:
                 self.animate_to(destination, 420)
             else:
                 self.animation.stop()
                 self.move(destination)
+        self.refresh_mask()
+        self.update()
         if not self.chat.isVisible():
             return
         opening = self.chat_motion.state() == QAbstractAnimation.Running
@@ -588,14 +740,17 @@ class Pet(QWidget):
         painter.translate(origin_x, origin_y)
         painter.scale(scale, scale)
         elapsed = time.monotonic() - self.mood_started
-        painter.save()
         y, angle, sx, sy, idle_wave, landing_done, progress = self._motion_pose()
         if landing_done:
             self.landing_started = None
-        painter.translate(41, 43+y)
+        if self.hanging and self.target and not self.docked:
+            self._paint_hang_band(painter, y, angle, sx, sy)
+        painter.save()
+        pivot = 43
+        painter.translate(41, pivot + y)
         painter.rotate(angle)
         painter.scale(sx, sy)
-        painter.translate(-41,-43)
+        painter.translate(-41, -pivot)
         if self.landing_started is not None and progress < 1:
             ring = QColor(self.target.get("accent") if self.target else "#8370da")
             ring.setAlpha(int(180 * (1 - progress)))
@@ -606,10 +761,10 @@ class Pet(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(QColor("#2d2d31"))
         lift_left = lift_right = 0
+        spread = dig = 0
         if self.target and not self.docked:
             dig = 5 * self.grip + max(0., -self.slip) * 0.45
             spread = 2.6 * self.grip
-            # Busy perched work: paws alternate up/down.
             if self.mood in ("thinking", "working"):
                 tap = (1 - math.cos(elapsed * 2 * math.pi / .36)) / 2
                 lift_left = 10 * tap
@@ -651,9 +806,10 @@ class Pet(QWidget):
             painter.drawEllipse(round(49+self.gaze_x), round(eye_y+self.gaze_y), 6, eye_h)
         if self.mood in ("thinking", "working", "done"):
             painter.setBrush(QColor("#ffffff"))
-            painter.drawEllipse(58, -2, 24, 24)
+            bubble_y = 46 if self.hanging and self.target else -2
+            painter.drawEllipse(58, bubble_y, 24, 24)
             symbol = {"thinking": "…", "working": "✦", "done": "✓"}[self.mood]
-            center = painter.transform().map(QPointF(70, 10))
+            center = painter.transform().map(QPointF(70, bubble_y + 12))
             painter.save()
             painter.resetTransform()
             painter.setFont(ui_font(max(12, round(13 * scale)), bold=True, subpixel=False))
@@ -664,9 +820,91 @@ class Pet(QWidget):
         painter.restore()
         painter.end()
 
+    def _paint_hang_band(self, painter, y, angle, _sx, _sy):
+        """A short tab above the crown. It meets the head and does not wrap the face."""
+        pivot = 43.0
+        dy = 11.0 - pivot
+        rad = math.radians(angle)
+        cos, sin = math.cos(rad), math.sin(rad)
+        crown_x = 41.0 - dy * sin
+        crown_y = pivot + y + dy * cos
+        start = QPointF(41, -1)
+        # Tuck the tip just inside the outline so the head covers the join.
+        end = QPointF(crown_x, crown_y + 1.2)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#4a4a52"))
+        painter.drawPath(self._strap_path(start, end, 8.0, 2.6))
+        painter.setBrush(QColor("#7c7c86"))
+        painter.drawPath(self._strap_path(start, end, 2.8, 1.1))
+
+    @staticmethod
+    def _strap_path(a, b, ra, rb):
+        """Tapered strap. Unlike the drag ribbon, a short length stays narrow at the head."""
+        sx, sy = float(a.x()), float(a.y())
+        ex, ey = float(b.x()), float(b.y())
+        dx, dy = ex - sx, ey - sy
+        length = math.hypot(dx, dy)
+        ra = max(0.8, float(ra))
+        rb = max(0.8, float(rb))
+        path = QPainterPath()
+        if length < 1.2:
+            path.addEllipse(sx - ra, sy - ra, ra * 2, ra * 2)
+            return path
+        ux, uy = dx / length, dy / length
+        samples = 12
+
+        def at(t):
+            radius = ra + (rb - ra) * t
+            return sx + dx * t, sy + dy * t, radius
+
+        centers = [at(i / samples) for i in range(samples + 1)]
+
+        def tangent(index):
+            if index == 0:
+                tx, ty = centers[1][0] - centers[0][0], centers[1][1] - centers[0][1]
+            elif index == samples:
+                tx = centers[index][0] - centers[index - 1][0]
+                ty = centers[index][1] - centers[index - 1][1]
+            else:
+                tx = centers[index + 1][0] - centers[index - 1][0]
+                ty = centers[index + 1][1] - centers[index - 1][1]
+            mag = math.hypot(tx, ty) or 1.0
+            return tx / mag, ty / mag
+
+        def arc(cx, cy, radius, nx0, ny0, outward_x, outward_y):
+            start_angle = math.atan2(ny0, nx0)
+            midpoint = start_angle + math.pi / 2
+            target = math.atan2(outward_y, outward_x)
+            delta = math.atan2(math.sin(midpoint - target), math.cos(midpoint - target))
+            sweep = math.pi if abs(delta) <= math.pi / 2 else -math.pi
+            return [
+                (cx + math.cos(start_angle + sweep * step / 8) * radius, cy + math.sin(start_angle + sweep * step / 8) * radius)
+                for step in range(1, 8)
+            ]
+
+        right, left = [], []
+        for index, (x, y, radius) in enumerate(centers):
+            tx, ty = tangent(index)
+            right.append((x - ty * radius, y + tx * radius))
+            left.append((x + ty * radius, y - tx * radius))
+        end_tx, end_ty = tangent(samples)
+        start_tx, start_ty = tangent(0)
+        path.moveTo(*right[0])
+        for point in right[1:]:
+            path.lineTo(*point)
+        for point in arc(centers[-1][0], centers[-1][1], centers[-1][2], -end_ty, end_tx, end_tx, end_ty):
+            path.lineTo(*point)
+        for point in reversed(left):
+            path.lineTo(*point)
+        for point in arc(centers[0][0], centers[0][1], centers[0][2], start_ty, -start_tx, -ux, -uy):
+            path.lineTo(*point)
+        path.closeSubpath()
+        return path
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.animation.stop()
+            self.hang_glide_until = 0.
             self.drag_start = event.globalPos() - self.pos()
             self.press_point = event.globalPos()
             self.press_center = self.visual_center()
@@ -718,6 +956,7 @@ class Pet(QWidget):
                     offset = self.visual_center() - self.pos()
                     new_pos = self.press_center + delta - offset
                 self.target = None
+                self.hanging = False
                 self.move(new_pos)
                 was_intact = not self.tether.broken
                 self.tether.update_points(self.tether_from, self.visual_center())
@@ -779,7 +1018,7 @@ class Pet(QWidget):
         menu.addAction("设置…", self.open_settings)
         menu.addSeparator()
         menu.addAction("回到顶部", self.detach)
-        menu.addAction("清空对话", self.clear_conversation)
+        menu.addAction("删除历史", self.clear_conversation)
         if self.target:
             menu.addAction("重新读取", self.reread_context)
             menu.addAction("断开窗口", self.detach)
@@ -823,14 +1062,32 @@ class Pet(QWidget):
             hwnds.append(int(self.chat.winId()))
         return hwnds
 
+    def _sync_overlay_hole(self):
+        """Keep the frame from painting over the mascot or the chat."""
+        holes = []
+        if self.overlay.isVisible() and self.target and not self.drag_start and not self.buried:
+            bounds = self.mask().boundingRect()
+            if not bounds.isEmpty():
+                holes.append(QRect(self.mapToGlobal(bounds.topLeft()), bounds.size()).adjusted(-6, -6, 6, 6))
+            if self.chat.isVisible():
+                holes.append(self.chat.frameGeometry().adjusted(-10, -10, 10, 10))
+        key = tuple((hole.x(), hole.y(), hole.width(), hole.height()) for hole in holes)
+        if key == self._overlay_hole_key:
+            return
+        self._overlay_hole_key = key
+        self.overlay.avoid(holes)
+
     def _raise_attached(self):
-        """Keep the mascot, border, and dialog in the attached window's z-order band."""
+        """Keep the border in the window's z-band, with the mascot above that border."""
         if not self.target or self.drag_start:
             return
+        self._sync_overlay_hole()
         stack_with_window(self.target["id"], self._layer_hwnds())
 
     def _float_layer(self):
         """Perch and drag stay above other apps so the mascot can be picked up."""
+        self._overlay_hole_key = ()
+        self.overlay.avoid(None)
         float_above(self._layer_hwnds())
 
     def apply_cover(self, covered):
@@ -871,8 +1128,10 @@ class Pet(QWidget):
         self.chat.input.setFocus(Qt.ActiveWindowFocusReason)
         if self.target and not self.drag_start:
             self._raise_attached()
+            QTimer.singleShot(0, self._raise_attached)
         else:
             self._float_layer()
+            QTimer.singleShot(0, self._float_layer)
         QTimer.singleShot(0, self.chat.input.setFocus)
         if opening:
             self.chat_motion.stop()
@@ -899,9 +1158,10 @@ class Pet(QWidget):
 
     def _active_window(self):
         # While dragging, the live target is cleared. Keep saving under the window we left.
-        if self._transcript_window:
-            return self._transcript_window
-        return self.target
+        saved = getattr(self, "_transcript_window", None)
+        if saved:
+            return saved
+        return getattr(self, "target", None)
 
     def _remember_current(self):
         window = self._active_window()
@@ -1040,6 +1300,7 @@ class Pet(QWidget):
         return super().nativeEvent(eventType, message)
 
     def close_chat(self):
+        self.chat.placed_by_user = False
         self.chat.hide()
         if self.target or not self.docked:
             self.return_home()
@@ -1050,9 +1311,16 @@ class Pet(QWidget):
         self.undo.clear()
         self.api_history.clear()
         self.bridge.invalidate()
-        self.chat.clear_messages()
+        self._history_loaded = True
+        self.chat.reset_messages()
+        window = self._active_window()
+        if window:
+            forget_window(window)
+        else:
+            forget_idle()
         self.chat.send_button.setEnabled(True)
         self.chat.stop_button.hide()
+        self.chat.status.setText("历史已删除")
         self.set_mood("idle")
 
     def detach(self, ask=True):
@@ -1067,6 +1335,7 @@ class Pet(QWidget):
         self.grants.clear()
         self.bridge.invalidate()
         self.target = None
+        self.hanging = False
         self._transcript_window = None
         self._history_loaded = False
         self.live_rect = None
@@ -1100,11 +1369,14 @@ class Pet(QWidget):
             # bury/restore and only detaches when the window is gone.
             return
         self.misses = 0
-        title_changed = current["title"] != self.target.get("title")
+        from orbit.desktop.office import document_name
+        def title_key(text):
+            name = document_name(text or "")
+            return name.lower() if name else (text or "").replace("*", "").strip()
+        title_changed = title_key(current.get("title")) != title_key(self.target.get("title"))
         preserved = {key: self.target.get(key) for key in ("path", "entries", "preview", "summary", "accent", "url", "detail_level")}
         self.target = current
-        if not title_changed:
-            self.target.update({key: value for key, value in preserved.items() if value is not None})
+        self.target.update({key: value for key, value in preserved.items() if value})
         rect = self.live_rect if self.live_rect is not None else current["rect"]
         self.target["rect"] = rect
         if self.buried:
@@ -1128,12 +1400,12 @@ class Pet(QWidget):
                 self.detach(ask=False)
             return
         if payload == ("hidden",):
-            # Minimized, cloaked, or otherwise not visible — follow the window away.
+            # The window itself left the screen (minimized or cloaked).
             self.ride_vx = self.ride_vy = 0.
             self.misses = 0
             self.apply_cover(True)
             return
-        rect, covered = payload
+        rect, _covered = payload
         self.misses = 0
         new_rect = QRect(*rect)
         old = self.target.get("rect")
@@ -1144,10 +1416,6 @@ class Pet(QWidget):
             if window["id"] == wid:
                 window["rect"] = QRect(new_rect)
                 break
-        if covered:
-            self.ride_vx = self.ride_vy = 0.
-            self.apply_cover(True)
-            return
         revealed = self.buried
         self.apply_cover(False)
         if moved and old is not None and not revealed:
@@ -1168,7 +1436,8 @@ class Pet(QWidget):
             candidate = Path(self.target["path"])
             folder = candidate if candidate.is_dir() else candidate.parent
             try:
-                if folder.is_dir() and os.access(folder, os.W_OK):
+                from orbit.desktop.office import is_blocked_dir
+                if folder.is_dir() and os.access(folder, os.W_OK) and not is_blocked_dir(folder):
                     return str(folder.resolve())
             except OSError:
                 pass
@@ -1218,6 +1487,7 @@ class Pet(QWidget):
             self.chat.append(self.chat.assistant_name(), f"「{label}」已经约 90 秒没有新进展。可以点「结束任务」，或再等一会儿。")
 
     def ask(self, message):
+        log_event("chat", message, role="user", window=(self.target or {}).get("title") or "")
         if self.target and self.context_pending:
             self.pending_message = message
             self.begin_activity("正在读取窗口路径")
@@ -1246,16 +1516,25 @@ class Pet(QWidget):
             return
         self.api_generation += 1
         self.api_round = 0
+        self._retry_noted = False
+        self._turn_wrote = False
+        self._claim_nudges = 0
         self.api_user_message = message
         self.touch_activity("正在等待模型回复")
+        sent = message
+        attached_document = self.target and self.target.get("kind") == "document"
+        if attached_document and message.strip() in {"确认", "执行", "可以", "好", "好的", "同意", "改吧", "是", "对"}:
+            sent = message + "\n请立刻调用 edit_document 完成上一步说的修改。不要只用文字说已经改好，不要使用 shell。"
         context = (
             "你是 Orbit 桌面助手，用中文回复。需要查看或修改文件时调用工具，不要假装已经读过或改过。"
-            "写入文件和运行命令会先请用户确认。敏感文件会读取失败。浏览器没有正文时，用 fetch_url 读取 http 或 https 地址。\n"
+            "吸附的是 WPS 或 Word 时，只用 read_document 和 edit_document 修改 .docx。用户要求改文档时立刻调用 edit_document，传 paragraph 和 new，直接写入，不要询问是否执行。"
+            "没有工具返回已写入或已改好之前，禁止说已经改好、已替换、已写入或命令已执行。不要用 shell、python 或 document.xml。"
+            "不要让用户自己在 WPS 里改，也不要让用户关闭文档。运行命令仍会请用户确认。敏感文件会读取失败。浏览器没有正文时，用 fetch_url 读取 http 或 https 地址。\n"
             + context_prompt(self.target, self.working_directory())
         )
         kept = get_config().api.history_messages
         history = self.api_history[-kept:] if kept else []
-        messages = [{"role": "system", "content": context}] + history + [{"role": "user", "content": message}]
+        messages = [{"role": "system", "content": context}] + history + [{"role": "user", "content": sent}]
         self.post_api(messages)
 
     def post_api(self, messages):
@@ -1290,7 +1569,8 @@ class Pet(QWidget):
                 if attempt + 1 >= attempts or generation != self.api_generation:
                     self.api_result.emit(generation, {"ok": False, "error": str(error)})
                     return
-                self.api_progress.emit(generation, "响应中断了，正在重新请求，任务会继续")
+                reason = str(error).split("（", 1)[0].strip() or "响应中断"
+                self.api_progress.emit(generation, f"模型暂未回应（{reason[:60]}），正在重新请求")
                 time.sleep(1.2)
                 continue
             except ApiError as error:
@@ -1308,6 +1588,10 @@ class Pet(QWidget):
         if generation != self.api_generation or self.activity_started is None or self.api_tool_running:
             return
         self.touch_activity(label, working=("操作" in label or "执行" in label))
+        if "重新请求" in label and not getattr(self, "_retry_noted", False):
+            self._retry_noted = True
+            if self.chat.isVisible():
+                self.chat.append(self.chat.assistant_name(), label + "。")
 
     def api_finished(self, generation, result):
         if generation != self.api_generation:
@@ -1331,6 +1615,23 @@ class Pet(QWidget):
                 answer = message_obj.get("reasoning_content") or ""
             if not isinstance(answer, str) or not answer.strip():
                 raise ValueError("接口返回空回复")
+            if not self._turn_wrote and claims_unverified_edit(answer):
+                if self._claim_nudges < 1 and self.api_round < get_config().api.max_rounds:
+                    self._claim_nudges += 1
+                    self.api_round += 1
+                    log_event("error", "模型声称已修改但没有写入", detail=answer[:500])
+                    if self.chat.isVisible():
+                        self.chat.append(self.chat.assistant_name(), "刚才的回复没有真正写入文档，正在改为直接修改。")
+                    note = (
+                        "系统检查：上一句声称已经改好或已经执行，但没有 edit_document 的成功结果。"
+                        "请立刻调用 edit_document 修改当前文档。不要再询问，不要使用 shell，不要说已经改好。"
+                    )
+                    self.post_api(self.api_messages + [
+                        {"role": "assistant", "content": answer},
+                        {"role": "user", "content": note},
+                    ])
+                    return
+                answer = "这次没有写入文档。模型没有调用修改工具。请再说一次要改哪一段、改成什么。"
             self.api_history.extend([{"role": "user", "content": result["message"]}, {"role": "assistant", "content": answer}])
             self.on_finished(answer)
             self.chat.status.setText("API 已就绪")
@@ -1343,7 +1644,14 @@ class Pet(QWidget):
         self.api_tool_running = True
         self.touch_activity("正在执行操作", working=True)
         root = self.working_directory()
-        blocked = bool(self.target and not self.target.get("path"))
+        window_title = self.target.get("title") if self.target else ""
+        window_command = self.target.get("command") if self.target else ""
+        from orbit.desktop.office import document_name
+        named = bool(document_name(window_title or ""))
+        document = None
+        if self.target and (self.target.get("kind") == "document" or named):
+            document = self.target.get("path")
+        blocked = bool(self.target and not self.target.get("path") and not named and self.target.get("kind") != "document")
         content = message_obj.get("content") or ""
         assistant = {"role": "assistant", "content": message_obj.get("content"), "tool_calls": tool_calls}
         if message_obj.get("reasoning_content"):
@@ -1352,7 +1660,7 @@ class Pet(QWidget):
             self.chat.append(self.chat.assistant_name(), content.strip())
         threading.Thread(
             target=self._run_tool_round,
-            args=(generation, root, blocked, assistant, tool_calls),
+            args=(generation, root, blocked, assistant, tool_calls, document, window_title or "", window_command or ""),
             daemon=True,
         ).start()
 
@@ -1394,9 +1702,21 @@ class Pet(QWidget):
         if generation != self.api_generation:
             return
         self.api_tool_running = False
+        if any(edit_succeeded(item.get("content") or "") for item in follow):
+            self._turn_wrote = True
         self.post_api(self.api_messages + [assistant] + follow)
 
-    def _run_tool_round(self, generation, root, blocked, assistant, tool_calls):
+    def _run_tool_round(self, generation, root, blocked, assistant, tool_calls, document=None, window_title="", window_command=""):
+        if not document:
+            try:
+                from orbit.desktop.office import locate_document
+                located = locate_document(window_title, window_command)
+            except Exception:
+                located = None
+            if located:
+                document = str(located)
+                root = str(located.parent)
+                blocked = False
         follow = []
         for call in tool_calls:
             if self.api_generation != generation:
@@ -1405,6 +1725,7 @@ class Pet(QWidget):
             function = call.get("function") or {}
             name = function.get("name") or ""
             raw_args = function.get("arguments") or "{}"
+            args = {}
             try:
                 args = json.loads(raw_args) if isinstance(raw_args, str) and raw_args.strip() else (raw_args if isinstance(raw_args, dict) else {})
             except ValueError:
@@ -1414,7 +1735,8 @@ class Pet(QWidget):
                 if blocked and name != "fetch_url":
                     output = "当前窗口还没有解析出目录，已拒绝改用主目录。"
                 else:
-                    output = run_tool(name, args, root, self._tool_confirm, self.undo.remember)
+                    output = run_tool(name, args, root, self._tool_confirm, self.undo.remember, document)
+            log_event("tool", output, name=name, args=json.dumps(args, ensure_ascii=False, default=str)[:2000])
             follow.append({"role": "tool", "tool_call_id": call.get("id") or "", "content": output})
         if self.api_generation != generation:
             self.api_tool_running = False
@@ -1438,6 +1760,7 @@ class Pet(QWidget):
         self.chat.status.setText("已结束任务")
 
     def on_error(self, message):
+        log_event("error", message)
         self.end_activity()
         self.chat.status.setText(message)
         if self.chat.isVisible():
@@ -1457,6 +1780,7 @@ class Pet(QWidget):
     def on_finished(self, text):
         if self.activity_started is None and self.chat.send_button.isEnabled() and not self.chat.streaming:
             return
+        log_event("chat", text, role="assistant")
         self.end_activity()
         self.chat.finish(text)
         self.set_mood("done")

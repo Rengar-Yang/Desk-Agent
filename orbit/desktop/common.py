@@ -13,6 +13,10 @@ TERMINALS_EXACT = {
 TERMINALS_PARTS = ("terminal", "kitty", "alacritty", "wezterm", "konsole", "ptyxis")
 BROWSERS_PARTS = ("firefox", "chrome", "chromium", "brave", "msedge", "opera", "vivaldi")
 EDITORS_PARTS = ("cursor", "code", "gedit", "kate", "sublime", "emacs", "texteditor", "notepad")
+DOCUMENTS_EXACT = {
+    "wps.exe", "et.exe", "wpp.exe", "wpsoffice.exe", "wpspdf.exe", "ksolaunch.exe",
+    "winword.exe", "excel.exe", "powerpnt.exe",
+}
 
 # Overlay / capture helpers that sit above real windows but are not attach targets.
 OVERLAY_EXACT = {
